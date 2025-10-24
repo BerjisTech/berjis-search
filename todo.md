@@ -59,13 +59,13 @@ Near‑term improvements
 
 Action items
 
-- [ ] Add stemming (English) in tokenizer; keep original for display.
-- [ ] Add ASCII‑folded copy for matching; keep original for scoring/display.
-- [ ] Add simple prefix/n‑gram index for short tokens (min length 3).
-- [ ] Add optional fuzzy fallback (edit distance 1) for rare queries.
-- [ ] Extend crawler to extract and index main body text (readability/boilerplate removal).
-- [ ] Switch crawler to periodic batch upserts (every N pages) and final flush.
-- [ ] Add per‑host/domain crawl stats in admin (pages, sitemaps, delay, last fetch).
+- [x] Add stemming (English) in tokenizer; keep original for display.
+- [x] Add ASCII-folded copy for matching; keep original for scoring/display.
+- [x] Add simple prefix/n-gram index for short tokens (min length 3).
+- [x] Add optional fuzzy fallback (edit distance 1) for rare queries.
+- [x] Extend crawler to extract and index main body text (readability/boilerplate removal).
+- [x] Switch crawler to periodic batch upserts (every N pages) and final flush.
+- [x] Add per-host/domain crawl stats in admin (pages, sitemaps, delay, last fetch).
 - [ ] Add language detection and per‑language stopword lists.
 - [ ] Add UI facet for language and a toggle for fuzzy/prefix matching.
 
@@ -74,3 +74,9 @@ Notes
 - All new matching logic should be guarded behind flags/toggles to evaluate impact.
 - Keep politeness and robots.txt compliance as a priority when expanding breadth.
 
+Implementation notes
+
+- Added environment toggles (default on): `SEARCH_ENABLE_STEMMING=1`, `SEARCH_ENABLE_PREFIX=1`, `SEARCH_ENABLE_FUZZY=1`, and `SEARCH_PREFIX_MINLEN=3`.
+- Tokenization now lowercases, ASCII-folds, removes stopwords, and applies light stemming; originals are preserved on documents for display/scoring content.
+- Crawler now extracts main text from `<article>/<main>/<body>`, removes scripts/styles/tags, and batches uploads with `BATCH_SIZE` (default 100), plus a final flush.
+- Added crawler stats endpoint: `GET/POST /v1/admin/crawler/stats` persisted to `PERSIST_DIR/crawler-stats.json`.

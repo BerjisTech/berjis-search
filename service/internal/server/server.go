@@ -1,6 +1,8 @@
 package server
 
 import (
+    "encoding/json"
+    "os"
     "path/filepath"
     "strconv"
     "strings"
@@ -23,6 +25,33 @@ func New(opts Options) *fiber.App {
     _ = store.Images.Load(filepath.Join(cfg.PersistDir, "images.json"))
     _ = store.Videos.Load(filepath.Join(cfg.PersistDir, "videos.json"))
     _ = store.News.Load(filepath.Join(cfg.PersistDir, "news.json"))
+    // Crawler stats (persisted)
+    type HostStat struct{ PagesFetched, BlockedByRobots, CrawlDelaySeconds, SitemapCount int; LastFetch string }
+    type CrawlerStats struct{ Hosts map[string]HostStat `json:"hosts"`; Timestamp string `json:"timestamp"` }
+    statsPath := filepath.Join(cfg.PersistDir, "crawler-stats.json")
+    crawlStats := CrawlerStats{Hosts: map[string]HostStat{}, Timestamp: ""}
+    if b, err := os.ReadFile(statsPath); err == nil { _ = json.Unmarshal(b, &crawlStats) }
+
+    // Synonyms dictionary (persisted)
+    type Synonyms map[string][]string
+    synPath := filepath.Join(cfg.PersistDir, "synonyms.json")
+    synMap := Synonyms{}
+    if b, err := os.ReadFile(synPath); err == nil { _ = json.Unmarshal(b, &synMap) }
+    // apply on startup
+    searchindex.SetSynonyms(synMap)
+
+    // Domain priors (persisted): suffix -> multiplier
+    type Priors map[string]float64
+    priorsPath := filepath.Join(cfg.PersistDir, "priors.json")
+    priors := Priors{}
+    if b, err := os.ReadFile(priorsPath); err == nil { _ = json.Unmarshal(b, &priors) }
+    searchindex.SetDomainPriors(priors)
+    // Weights (persisted): field -> weight
+    type Weights map[string]float64
+    weightsPath := filepath.Join(cfg.PersistDir, "weights.json")
+    weights := Weights{}
+    if b, err := os.ReadFile(weightsPath); err == nil { _ = json.Unmarshal(b, &weights) }
+    if len(weights) > 0 { searchindex.SetWeights(weights) }
 
     // CORS allowlist (reflect origin) for berjis.test and subdomains
     app.Use(func(c *fiber.Ctx) error {
@@ -100,6 +129,106 @@ func New(opts Options) *fiber.App {
         default: return c.Status(400).JSON(fiber.Map{"success": false, "message": "unknown vertical"})
         }
         return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"total": ix.Total(), "facets": fiber.Map{"source": ix.FacetSource()}}})
+    })
+    // Admin: crawler stats get/post
+    app.Get("/v1/admin/crawler/stats", func(c *fiber.Ctx) error {
+        return c.JSON(fiber.Map{"success": true, "data": crawlStats})
+    })
+    app.Post("/v1/admin/crawler/stats", func(c *fiber.Ctx) error {
+        var body CrawlerStats
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        if body.Hosts == nil { body.Hosts = map[string]HostStat{} }
+        crawlStats = body
+        // persist
+        _ = os.MkdirAll(cfg.PersistDir, 0o755)
+        if b, err := json.MarshalIndent(crawlStats, "", "  "); err == nil { _ = os.WriteFile(statsPath, b, 0o644) }
+        return c.JSON(fiber.Map{"success": true, "data": crawlStats})
+    })
+
+    // Admin: synonyms get/put
+    app.Get("/v1/admin/synonyms", func(c *fiber.Ctx) error {
+        return c.JSON(fiber.Map{"success": true, "data": synMap})
+    })
+
+    // Admin: domain priors get/put
+    app.Get("/v1/admin/priors", func(c *fiber.Ctx) error {
+        return c.JSON(fiber.Map{"success": true, "data": priors})
+    })
+    app.Put("/v1/admin/priors", func(c *fiber.Ctx) error {
+        var body Priors
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        // normalize keys
+        norm := Priors{}
+        for k, v := range body {
+            lk := strings.ToLower(strings.TrimSpace(k))
+            if lk == "" || v <= 0 { continue }
+            norm[lk] = v
+        }
+        priors = norm
+        searchindex.SetDomainPriors(priors)
+        _ = os.MkdirAll(cfg.PersistDir, 0o755)
+        if b, err := json.MarshalIndent(priors, "", "  "); err == nil { _ = os.WriteFile(priorsPath, b, 0o644) }
+        return c.JSON(fiber.Map{"success": true, "data": priors})
+    })
+    app.Put("/v1/admin/synonyms", func(c *fiber.Ctx) error {
+        var body Synonyms
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        // normalize keys/values to lowercase
+        norm := Synonyms{}
+        for k, arr := range body {
+            lk := strings.ToLower(strings.TrimSpace(k))
+            if lk == "" { continue }
+            vals := []string{}
+            for _, v := range arr {
+                lv := strings.ToLower(strings.TrimSpace(v))
+                if lv != "" { vals = append(vals, lv) }
+            }
+            norm[lk] = vals
+        }
+        synMap = norm
+        searchindex.SetSynonyms(synMap)
+        _ = os.MkdirAll(cfg.PersistDir, 0o755)
+        if b, err := json.MarshalIndent(synMap, "", "  "); err == nil { _ = os.WriteFile(synPath, b, 0o644) }
+        return c.JSON(fiber.Map{"success": true, "data": synMap})
+    })
+    // Admin: domain priors get/put
+    app.Get("/v1/admin/priors", func(c *fiber.Ctx) error {
+        return c.JSON(fiber.Map{"success": true, "data": priors})
+    })
+    app.Put("/v1/admin/priors", func(c *fiber.Ctx) error {
+        var body Priors
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        // normalize keys
+        norm := Priors{}
+        for k, v := range body {
+            lk := strings.ToLower(strings.TrimSpace(k))
+            if lk == "" || v <= 0 { continue }
+            norm[lk] = v
+        }
+        priors = norm
+        searchindex.SetDomainPriors(priors)
+        _ = os.MkdirAll(cfg.PersistDir, 0o755)
+        if b, err := json.MarshalIndent(priors, "", "  "); err == nil { _ = os.WriteFile(priorsPath, b, 0o644) }
+        return c.JSON(fiber.Map{"success": true, "data": priors})
+    })
+    // Admin: weights get/put
+    app.Get("/v1/admin/weights", func(c *fiber.Ctx) error {
+        return c.JSON(fiber.Map{"success": true, "data": weights})
+    })
+    app.Put("/v1/admin/weights", func(c *fiber.Ctx) error {
+        var body Weights
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        norm := Weights{}
+        for k, v := range body {
+            lk := strings.ToLower(strings.TrimSpace(k))
+            if lk == "" || v <= 0 { continue }
+            norm[lk] = v
+        }
+        weights = norm
+        searchindex.SetWeights(weights)
+        _ = os.MkdirAll(cfg.PersistDir, 0o755)
+        if b, err := json.MarshalIndent(weights, "", "  "); err == nil { _ = os.WriteFile(weightsPath, b, 0o644) }
+        return c.JSON(fiber.Map{"success": true, "data": weights})
     })
     // Inspection: list docs
     app.Get("/v1/admin/index/:vertical/docs", func(c *fiber.Ctx) error {
@@ -227,11 +356,14 @@ func New(opts Options) *fiber.App {
         return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"total": ix.Total(), "from": map[bool]string{true:"memory", false:"disk"}[from=="memory"]}})
     })
 
-    type BulkWeb struct { Docs []searchindex.Doc `json:"docs"` }
+    type BulkWebDoc struct { ID, Title, Url, Snippet, Body, Headings, Source, Date, Lang string }
+    type BulkWeb struct { Docs []BulkWebDoc `json:"docs"` }
     app.Post("/v1/admin/index/web", func(c *fiber.Ctx) error {
         var body BulkWeb
         if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
-        for _, d := range body.Docs { store.Web.Add(d) }
+        for _, d := range body.Docs {
+            store.Web.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Snippet, Body: d.Body, Headings: d.Headings, Source: d.Source, Date: d.Date, Lang: d.Lang})
+        }
         _ = store.Web.Save(filepath.Join(cfg.PersistDir, "web.json"))
         return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
     })
@@ -280,13 +412,18 @@ func New(opts Options) *fiber.App {
 
         // 'all' → web index search with filters
         if typ == "all" {
-            found, total, facets := store.Web.FilteredSearch(q, sourceF, from, to, sort, page, 10)
+            lang := c.Query("lang", "")
+            found, total, facets := store.Web.FilteredSearch(q, sourceF, lang, from, to, sort, page, 10)
             type Web struct{ Title, Url, Snippet, Source string }
             out := make([]Web, 0, len(found))
+            langFacets := map[string]int64{}
             for _, r := range found {
                 out = append(out, Web{Title: r.Doc.Title, Url: r.Doc.Url, Snippet: highlight(r.Doc.Snippet, q), Source: r.Doc.Source})
+                l := strings.TrimSpace(strings.ToLower(r.Doc.Lang))
+                if l == "" { l = "unknown" }
+                langFacets[l] = langFacets[l] + 1
             }
-            return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": total, "results": out, "facets": fiber.Map{"source": facets}}})
+            return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": total, "results": out, "facets": fiber.Map{"source": facets, "lang": langFacets}}})
         }
 
         // Placeholder results; swap with real index/metasearch later
@@ -298,17 +435,17 @@ func New(opts Options) *fiber.App {
 
         switch typ {
         case "images":
-            found, totalCount, facets := store.Images.FilteredSearch(q, sourceF, from, to, sort, page, 30)
+            found, totalCount, facets := store.Images.FilteredSearch(q, sourceF, "", from, to, sort, page, 30)
             out := make([]Image, 0, len(found))
             for _, r := range found { out = append(out, Image{ Title: r.Doc.Title, ThumbnailUrl: r.Doc.Snippet, ImageUrl: r.Doc.Url, Source: r.Doc.Source }) }
             return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": out, "facets": fiber.Map{"source": facets}}})
         case "videos":
-            found, totalCount, facets := store.Videos.FilteredSearch(q, sourceF, from, to, sort, page, 10)
+            found, totalCount, facets := store.Videos.FilteredSearch(q, sourceF, "", from, to, sort, page, 10)
             outV := make([]Video, 0, len(found))
             for _, r := range found { outV = append(outV, Video{ Title: r.Doc.Title, Url: r.Doc.Url, Duration: r.Doc.Snippet, Source: r.Doc.Source }) }
             return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": outV, "facets": fiber.Map{"source": facets}}})
         case "news":
-            found, totalCount, facets := store.News.FilteredSearch(q, sourceF, from, to, sort, page, 10)
+            found, totalCount, facets := store.News.FilteredSearch(q, sourceF, "", from, to, sort, page, 10)
             outN := make([]Web, 0, len(found))
             for _, r := range found { outN = append(outN, Web{ Title: r.Doc.Title, Url: r.Doc.Url, Snippet: highlight(r.Doc.Snippet, q), Source: r.Doc.Source }) }
             return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": outN, "facets": fiber.Map{"source": facets}}})

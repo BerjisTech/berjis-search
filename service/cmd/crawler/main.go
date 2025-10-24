@@ -16,7 +16,10 @@ import (
     "time"
 
     "github.com/berjistech/berjis-ecosystem/search/service/internal/config"
+    whatlang "github.com/abadojack/whatlanggo"
 )
+
+type item struct{ u string; depth int }
 
 var (
     reTitle    = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
@@ -27,9 +30,22 @@ var (
     reMetaArtPub = regexp.MustCompile(`(?is)<meta\s+property=["']article:published_time["']\s+content=["']([^"']+)["'][^>]*>`) 
     reLinks    = regexp.MustCompile(`(?is)<a\s+[^>]*href=["']([^"']+)["'][^>]*>`) 
     reImgTags  = regexp.MustCompile(`(?is)<img\s+[^>]*src=["']([^"']+)["'][^>]*>`) 
+    reArticle  = regexp.MustCompile(`(?is)<article[^>]*>([\s\S]*?)</article>`) 
+    reMain     = regexp.MustCompile(`(?is)<main[^>]*>([\s\S]*?)</main>`) 
+    reBody     = regexp.MustCompile(`(?is)<body[^>]*>([\s\S]*?)</body>`) 
+    reScript   = regexp.MustCompile(`(?is)<script[^>]*>[\s\S]*?</script>`) 
+    reStyle    = regexp.MustCompile(`(?is)<style[^>]*>[\s\S]*?</style>`) 
+    reH1       = regexp.MustCompile(`(?is)<h1[^>]*>([\s\S]*?)</h1>`) 
+    reH2       = regexp.MustCompile(`(?is)<h2[^>]*>([\s\S]*?)</h2>`) 
+    reH3       = regexp.MustCompile(`(?is)<h3[^>]*>([\s\S]*?)</h3>`) 
+    reH4       = regexp.MustCompile(`(?is)<h4[^>]*>([\s\S]*?)</h4>`) 
+    reH5       = regexp.MustCompile(`(?is)<h5[^>]*>([\s\S]*?)</h5>`) 
+    reH6       = regexp.MustCompile(`(?is)<h6[^>]*>([\s\S]*?)</h6>`) 
+    reTags     = regexp.MustCompile(`(?is)<[^>]+>`) 
+    reComments = regexp.MustCompile(`(?s)<!--.*?-->`) 
 )
 
-type WebDoc struct { ID, Title, Url, Snippet, Source, Date string }
+type WebDoc struct { ID, Title, Url, Snippet, Body, Headings, Source, Date, Lang string }
 
 func main() {
     _ = config.Load() // reserved for future use
@@ -47,24 +63,31 @@ func main() {
             "http://architect.berjis.test",
         }
     }
-    // Frontier crawl
-    maxPages := atoi(getenv("MAX_PAGES", "50"))
-    maxDepth := atoi(getenv("MAX_DEPTH", "2"))
+    // Frontier crawl (persistent frontier)
+    maxPages := atoi(getenv("MAX_PAGES", "250"))
+    maxDepth := atoi(getenv("MAX_DEPTH", "4"))
     sameDomain := getenv("SAME_DOMAIN_ONLY", "true") == "true"
+    frontierPath := getenv("FRONTIER_PATH", "/data/search/frontier.json")
     allowed := map[string]bool{}
     for _, s := range seeds { if h := hostOf(strings.TrimSpace(s)); h != "" { allowed[h] = true } }
-    type item struct{ u string; depth int }
     q := []item{}
     seen := map[string]bool{}
-    for _, s := range seeds { s = strings.TrimSpace(s); if s != "" { q = append(q, item{u: s, depth: 0}) } }
+    // Load previous frontier
+    loadFrontier(frontierPath, &q, &seen)
+    // Merge in seeds at depth 0
+    for _, s := range seeds { s = strings.TrimSpace(s); if s != "" && !seen[s] { q = append(q, item{u: s, depth: 0}) } }
     webBatch := []WebDoc{}
     imgBatch := []map[string]string{}
     vidBatch := []map[string]string{}
     newsBatch := []map[string]string{}
+    batchSize := atoi(getenv("BATCH_SIZE", "100"))
+    if batchSize <= 0 { batchSize = 100 }
     count := 0
     hostPolicy := map[string]policy{}
     hostNext := map[string]time.Time{}
     hostCount := map[string]int{}
+    hostBlocked := map[string]int{}
+    hostLast := map[string]string{}
     maxPerHost := atoi(getenv("MAX_PER_HOST", "20"))
     ua := getenv("CRAWLER_USER_AGENT", "BerjisBot/1.0")
     robotsUA := getenv("ROBOTS_USER_AGENT", "BerjisBot")
@@ -82,7 +105,7 @@ func main() {
             pol = fetchRobots(client, h, robotsUA)
             hostPolicy[h] = pol
         }
-        if !pol.allowed(u) { continue }
+        if !pol.allowed(u) { hostBlocked[h] = hostBlocked[h] + 1; continue }
         // per-host crawl delay
         if nxt := hostNext[h]; time.Now().Before(nxt) {
             time.Sleep(nxt.Sub(time.Now()))
@@ -92,20 +115,30 @@ func main() {
         if status >= 400 || html == "" { continue }
         if pol.delay > 0 { hostNext[h] = time.Now().Add(pol.delay) }
         hostCount[h] = hostCount[h] + 1
+        hostLast[h] = time.Now().UTC().Format(time.RFC3339)
         title, desc := extractTitleDesc(html)
         if title == "" { title = u }
-        if desc == "" { desc = "Indexed by Berjis Crawler" }
+        if desc == "" { desc = title }
+        body := extractMainText(html)
+        headings := extractHeadings(html)
+        lang := detectLang(title+" "+desc+" "+body)
         now := time.Now().UTC().Format(time.RFC3339)
         id := fmt.Sprintf("%x", sha1.Sum([]byte(u)))
-        webBatch = append(webBatch, WebDoc{ID: id, Title: title, Url: u, Snippet: desc, Source: hostOf(u), Date: now})
+        webBatch = append(webBatch, WebDoc{ID: id, Title: title, Url: u, Snippet: desc, Body: body, Headings: headings, Source: hostOf(u), Date: now, Lang: lang})
+        if len(webBatch) >= batchSize {
+            postJSON(base+"/v1/admin/index/web", map[string]any{"docs": webBatch})
+            webBatch = webBatch[:0]
+        }
         // OG image/video
         if img := firstGroup(reMetaOGImg.FindStringSubmatch(html)); img != "" {
             ai := absURL(u, img)
             imgBatch = append(imgBatch, map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(ai))), "title": title, "thumbnailUrl": ai, "imageUrl": ai, "source": hostOf(ai), "date": now})
+            if len(imgBatch) >= batchSize { postJSON(base+"/v1/admin/index/images", map[string]any{"docs": imgBatch}); imgBatch = imgBatch[:0] }
         }
         if vid := firstGroup(reMetaOGVid.FindStringSubmatch(html)); vid != "" {
             av := absURL(u, vid)
             vidBatch = append(vidBatch, map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(av))), "title": title, "url": av, "duration": "", "source": hostOf(av), "date": now})
+            if len(vidBatch) >= batchSize { postJSON(base+"/v1/admin/index/videos", map[string]any{"docs": vidBatch}); vidBatch = vidBatch[:0] }
         }
         // News detection
         ogType := strings.ToLower(firstGroup(reMetaOGType.FindStringSubmatch(html)))
@@ -140,12 +173,26 @@ func main() {
             }
         }
     }
-    // Bulk POST
-    postJSON(base+"/v1/admin/index/web", map[string]any{"docs": webBatch})
+    // Final flush
+    if len(webBatch) > 0 { postJSON(base+"/v1/admin/index/web", map[string]any{"docs": webBatch}) }
     if len(imgBatch) > 0 { postJSON(base+"/v1/admin/index/images", map[string]any{"docs": imgBatch}) }
     if len(vidBatch) > 0 { postJSON(base+"/v1/admin/index/videos", map[string]any{"docs": vidBatch}) }
     if len(newsBatch) > 0 { postJSON(base+"/v1/admin/index/news", map[string]any{"docs": newsBatch}) }
-    log.Printf("crawler: indexed web=%d images=%d videos=%d news=%d (visited=%d)", len(webBatch), len(imgBatch), len(vidBatch), len(newsBatch), len(seen))
+    // Save updated frontier
+    saveFrontier(frontierPath, q, seen)
+    // Post crawl stats per host
+    stats := map[string]any{}
+    for h, c := range hostCount {
+        stats[h] = map[string]any{
+            "pagesFetched": c,
+            "blockedByRobots": hostBlocked[h],
+            "lastFetch": hostLast[h],
+            "crawlDelaySeconds": int(hostPolicy[h].delay.Seconds()),
+            "sitemapCount": len(hostPolicy[h].sitemaps),
+        }
+    }
+    postJSON(base+"/v1/admin/crawler/stats", map[string]any{"hosts": stats, "timestamp": time.Now().UTC().Format(time.RFC3339)})
+    log.Printf("crawler: batches flushed; visited=%d hosts=%d", len(seen), len(hostCount))
 }
 
 func fetchHTML(client *http.Client, ua, u string) (string, int) {
@@ -165,9 +212,110 @@ func extractTitleDesc(html string) (string, string) {
     return title, desc
 }
 
+// extractHeadings grabs H1-H6 texts, strips nested tags/comments, and collapses whitespace.
+func extractHeadings(html string) string {
+    parts := []string{}
+    caps := [][][]string{ reH1.FindAllStringSubmatch(html, -1), reH2.FindAllStringSubmatch(html, -1), reH3.FindAllStringSubmatch(html, -1), reH4.FindAllStringSubmatch(html, -1), reH5.FindAllStringSubmatch(html, -1), reH6.FindAllStringSubmatch(html, -1) }
+    for _, arr := range caps {
+        for _, m := range arr {
+            if len(m) >= 2 {
+                s := reComments.ReplaceAllString(m[1], " ")
+                s = reScript.ReplaceAllString(s, " ")
+                s = reStyle.ReplaceAllString(s, " ")
+                s = reTags.ReplaceAllString(s, " ")
+                s = stripSpaces(s)
+                s = strings.TrimSpace(s)
+                if s != "" { parts = append(parts, s) }
+            }
+        }
+    }
+    out := strings.Join(parts, " \n ")
+    if len(out) > 2000 { out = out[:2000] }
+    return out
+}
+
+func detectLang(text string) string {
+    t := strings.TrimSpace(text)
+    if t == "" { return "" }
+    info := whatlang.Detect(t)
+    if info.IsReliable() {
+        code := strings.ToLower(info.Lang.Iso6391())
+        if code != "" && code != "un" { return code }
+    }
+    // Fallback heuristic: ASCII-heavy text -> likely English
+    letters, ascii := 0, 0
+    lower := strings.ToLower(t)
+    for _, r := range lower {
+        if (r >= 'a' && r <= 'z') || r == ' ' { letters++ }
+        if r <= 0x7f { ascii++ }
+    }
+    if letters >= 20 && ascii*100/len([]rune(lower)) > 90 {
+        // presence of common English function words boosts confidence
+        if strings.Contains(lower, " the ") || strings.Contains(lower, " and ") || strings.Contains(lower, " of ") || strings.Contains(lower, " to ") {
+            return "en"
+        }
+    }
+    return ""
+}
+
+// extractMainText performs a naive readability-style extraction.
+func extractMainText(html string) string {
+    pick := ""
+    if m := reArticle.FindStringSubmatch(html); len(m) >= 2 { pick = m[1] }
+    if pick == "" { if m := reMain.FindStringSubmatch(html); len(m) >= 2 { pick = m[1] } }
+    if pick == "" { if m := reBody.FindStringSubmatch(html); len(m) >= 2 { pick = m[1] } }
+    if pick == "" { pick = html }
+    pick = reComments.ReplaceAllString(pick, " ")
+    pick = reScript.ReplaceAllString(pick, " ")
+    pick = reStyle.ReplaceAllString(pick, " ")
+    pick = strings.ReplaceAll(pick, "<p", "\n<p")
+    pick = strings.ReplaceAll(pick, "<div", "\n<div")
+    pick = strings.ReplaceAll(pick, "<br", "\n<br")
+    pick = reTags.ReplaceAllString(pick, " ")
+    pick = stripSpaces(pick)
+    pick = strings.TrimSpace(pick)
+    if len(pick) > 4000 { pick = pick[:4000] }
+    return pick
+}
+
 func firstGroup(m []string) string { if len(m) >= 2 { return m[1] }; return "" }
 func stripSpaces(s string) string { return regexp.MustCompile(`\s+`).ReplaceAllString(s, " ") }
-func hostOf(u string) string { if i := strings.Index(u, "://"); i >= 0 { u = u[i+3:] }; if j := strings.Index(u, "/"); j >= 0 { u = u[:j] }; return u }
+func hostOf(u string) string {
+    if i := strings.Index(u, "://"); i >= 0 { u = u[i+3:] }
+    if j := strings.Index(u, "/"); j >= 0 { u = u[:j] }
+    if k := strings.Index(u, "#"); k >= 0 { u = u[:k] }
+    return u
+}
+
+// Persistent frontier helpers
+type frontierFile struct {
+    Queue    []struct{ U string `json:"u"`; D int `json:"depth"` } `json:"queue"`
+    Seen     []string `json:"seen"`
+    LastRun  string   `json:"lastRun"`
+}
+
+func loadFrontier(path string, q *[]item, seen *map[string]bool) {
+    b, err := os.ReadFile(path)
+    if err != nil || len(b) == 0 { return }
+    var f frontierFile
+    if json.Unmarshal(b, &f) != nil { return }
+    for _, s := range f.Seen { (*seen)[s] = true }
+    for _, e := range f.Queue { *q = append(*q, item{u: e.U, depth: e.D}) }
+}
+
+func saveFrontier(path string, q []item, seen map[string]bool) {
+    f := frontierFile{Queue: []struct{ U string `json:"u"`; D int `json:"depth"` }{}, Seen: []string{}, LastRun: time.Now().UTC().Format(time.RFC3339)}
+    for _, it := range q { f.Queue = append(f.Queue, struct{ U string `json:"u"`; D int `json:"depth"` }{U: it.u, D: it.depth}) }
+    for s := range seen { f.Seen = append(f.Seen, s) }
+    _ = os.MkdirAll(dirOf(path), 0o755)
+    if b, err := json.MarshalIndent(f, "", "  "); err == nil { _ = os.WriteFile(path, b, 0o644) }
+}
+
+func dirOf(p string) string {
+    i := strings.LastIndex(p, "/")
+    if i <= 0 { return "." }
+    return p[:i]
+}
 func getenv(k, d string) string { if v := os.Getenv(k); v != "" { return v }; return d }
 func atoi(s string) int { n := 0; for _, r := range s { if r<'0'||r>'9' { return n }; n = n*10 + int(r-'0') }; return n }
 func absURL(baseStr, ref string) string {

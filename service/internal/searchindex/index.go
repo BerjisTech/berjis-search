@@ -6,6 +6,8 @@ import (
     "net/url"
     "os"
     "sort"
+    "strconv"
+    "fmt"
     "strings"
     "time"
 )
@@ -15,35 +17,195 @@ type Doc struct {
     Title   string
     Url     string
     Snippet string
+    Body    string
+    Headings string
     Source  string
     Date    string // RFC3339 preferred
+    Lang    string // ISO 639-1 (e.g., "en"), optional
 }
 
 type Index struct {
     docs   map[string]Doc
     titlePos   map[string]map[string][]int // token -> docID -> positions in title
     snippetPos map[string]map[string][]int // token -> docID -> positions in snippet
+    bodyPos    map[string]map[string][]int // token -> docID -> positions in body
+    urlPos     map[string]map[string][]int // token -> docID -> positions in URL (host/path)
+    headingsPos map[string]map[string][]int // token -> docID -> positions in headings
     total  int
 }
 
-func New() *Index { return &Index{docs: map[string]Doc{}, titlePos: map[string]map[string][]int{}, snippetPos: map[string]map[string][]int{}, total: 0} }
+func New() *Index { return &Index{docs: map[string]Doc{}, titlePos: map[string]map[string][]int{}, snippetPos: map[string]map[string][]int{}, bodyPos: map[string]map[string][]int{}, urlPos: map[string]map[string][]int{}, headingsPos: map[string]map[string][]int{}, total: 0} }
 
-var stopwords = map[string]struct{}{
+var englishStopwords = map[string]struct{}{
     "the":{},"is":{},"at":{},"which":{},"on":{},"and":{},"a":{},"an":{},"for":{},"to":{},"in":{},"of":{},"with":{},"as":{},"by":{},"it":{},"this":{},"that":{},"be":{},"or":{},"not":{},
 }
+func getStopwords(lang string) map[string]struct{} {
+    if lang == "en" { return englishStopwords }
+    return map[string]struct{}{}
+}
 
-func tokenize(s string) []string {
-    // naive tokenization: split non-letters, lowercase, drop short tokens/stopwords
+// Feature toggles via environment variables (defaults enabled)
+var (
+    enableStemming = getenvDefault("SEARCH_ENABLE_STEMMING", "1") != "0"
+    enablePrefix   = getenvDefault("SEARCH_ENABLE_PREFIX", "1") != "0"
+    enableFuzzy    = getenvDefault("SEARCH_ENABLE_FUZZY", "1") != "0"
+    prefixMinLen   = getIntDefault("SEARCH_PREFIX_MINLEN", 2)
+    synonymsMap    = map[string][]string{}
+    // diversify result lists by limiting hits per source (domain)
+    maxPerSource   = getIntDefault("SEARCH_MAX_PER_SOURCE", 3)
+    domainPriors   = map[string]float64{}
+    // field weights (overridable via env and admin)
+    wTitle   = getFloatDefault("SEARCH_W_TITLE", 2.0)
+    wHead    = getFloatDefault("SEARCH_W_HEADINGS", 1.4)
+    wURL     = getFloatDefault("SEARCH_W_URL", 1.2)
+    wSnip    = getFloatDefault("SEARCH_W_SNIPPET", 1.0)
+    wBody    = getFloatDefault("SEARCH_W_BODY", 0.7)
+)
+
+// SetDomainPriors replaces the in-memory map of domain suffix -> multiplier (>1 boosts, <1 demotes).
+// Keys are matched as lowercase suffixes against Doc.Source (host). Example: ".co.ke": 1.2, ".africa": 1.25.
+func SetDomainPriors(m map[string]float64) {
+    domainPriors = map[string]float64{}
+    for k, v := range m {
+        lk := strings.ToLower(strings.TrimSpace(k))
+        if lk == "" { continue }
+        if v <= 0 { continue }
+        domainPriors[lk] = v
+    }
+}
+
+func domainBoostFor(host string) float64 {
+    if host == "" || len(domainPriors) == 0 { return 1.0 }
+    h := strings.ToLower(host)
+    best := 1.0
+    for suf, mul := range domainPriors {
+        if strings.HasSuffix(h, suf) {
+            if mul > best { best = mul }
+        }
+    }
+    return best
+}
+
+// SetSynonyms replaces the in-memory synonyms dictionary used for query expansion.
+// Keys and values should be lowercase strings. Call at startup or via admin.
+func SetSynonyms(m map[string][]string) {
+    synonymsMap = map[string][]string{}
+    for k, arr := range m {
+        lk := strings.ToLower(strings.TrimSpace(k))
+        if lk == "" { continue }
+        vals := []string{}
+        for _, v := range arr {
+            lv := strings.ToLower(strings.TrimSpace(v))
+            if lv != "" { vals = append(vals, lv) }
+        }
+        synonymsMap[lk] = vals
+    }
+}
+
+func getenvDefault(k, def string) string {
+    if v := os.Getenv(k); v != "" { return v }
+    return def
+}
+func getIntDefault(k string, def int) int {
+    v := getenvDefault(k, "")
+    if v == "" { return def }
+    if n, err := strconv.Atoi(v); err == nil { return n }
+    return def
+}
+func getFloatDefault(k string, def float64) float64 {
+    v := getenvDefault(k, "")
+    if v == "" { return def }
+    var f float64
+    if _, err := fmt.Sscan(v, &f); err == nil { return f }
+    return def
+}
+
+func asciiFold(s string) string {
+    // Map common accented Latin characters to ASCII equivalents
+    replacer := strings.NewReplacer(
+        "à", "a", "á", "a", "â", "a", "ã", "a", "ä", "a", "å", "a",
+        "ç", "c",
+        "è", "e", "é", "e", "ê", "e", "ë", "e",
+        "ì", "i", "í", "i", "î", "i", "ï", "i",
+        "ñ", "n",
+        "ò", "o", "ó", "o", "ô", "o", "õ", "o", "ö", "o",
+        "ù", "u", "ú", "u", "û", "u", "ü", "u",
+        "ý", "y", "ÿ", "y",
+        "À", "a", "Á", "a", "Â", "a", "Ã", "a", "Ä", "a", "Å", "a",
+        "Ç", "c",
+        "È", "e", "É", "e", "Ê", "e", "Ë", "e",
+        "Ì", "i", "Í", "i", "Î", "i", "Ï", "i",
+        "Ñ", "n",
+        "Ò", "o", "Ó", "o", "Ô", "o", "Õ", "o", "Ö", "o",
+        "Ù", "u", "Ú", "u", "Û", "u", "Ü", "u",
+        "Ÿ", "y",
+        "œ", "oe", "Œ", "oe", "æ", "ae", "Æ", "ae", "ß", "ss",
+    )
+    s = replacer.Replace(s)
+    // Replace any remaining non-ASCII letters/digits with space to split
     repl := func(r rune) rune {
         if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') { return r }
         return ' '
     }
-    cleaned := strings.Map(repl, strings.ToLower(s))
+    return strings.Map(repl, s)
+}
+
+func stemEn(tok string) string {
+    if !enableStemming { return tok }
+    s := tok
+    n := len(s)
+    if n <= 3 { return s }
+    // Plurals
+    if strings.HasSuffix(s, "ies") && n > 4 { // e.g., "bodies" -> "body"
+        return s[:n-3] + "y"
+    }
+    if strings.HasSuffix(s, "sses") && n > 4 { // "classes" -> "class"
+        return s[:n-2]
+    }
+    if strings.HasSuffix(s, "es") && n > 3 {
+        base := s[:n-2]
+        if strings.HasSuffix(base, "s") || strings.HasSuffix(base, "x") || strings.HasSuffix(base, "z") || strings.HasSuffix(base, "ch") || strings.HasSuffix(base, "sh") {
+            s = base
+            n = len(s)
+        }
+    }
+    if strings.HasSuffix(s, "s") && !strings.HasSuffix(s, "ss") && n > 3 { // docs -> doc
+        s = s[:len(s)-1]
+        n = len(s)
+    }
+    // Past/continuous
+    if strings.HasSuffix(s, "ing") && n > 5 {
+        base := s[:n-3]
+        if lb := len(base); lb >= 2 && base[lb-1] == base[lb-2] { base = base[:lb-1] }
+        return base
+    }
+    if strings.HasSuffix(s, "ed") && n > 4 {
+        base := s[:n-2]
+        if lb := len(base); lb >= 2 && base[lb-1] == base[lb-2] { base = base[:lb-1] }
+        return base
+    }
+    return s
+}
+
+func normalize(s string) string {
+    s = strings.ToLower(s)
+    s = asciiFold(s)
+    return s
+}
+
+func tokenize(s string) []string { return tokenizeForLang(s, "en") }
+
+func tokenizeForLang(s string, lang string) []string {
+    // normalize, split non-alnum, drop short tokens/stopwords, apply stemming
+    cleaned := normalize(s)
     parts := strings.Fields(cleaned)
     out := make([]string, 0, len(parts))
+    sw := getStopwords(lang)
     for _, p := range parts {
         if len(p) < 2 { continue }
-        if _, stop := stopwords[p]; stop { continue }
+        if _, stop := sw[p]; stop { continue }
+        if lang == "en" { p = stemEn(p) }
+        if p == "" { continue }
         out = append(out, p)
     }
     return out
@@ -57,7 +219,7 @@ func (ix *Index) Add(d Doc) {
     ix.total++
     // title positions
     p := 0
-    for _, tok := range tokenize(d.Title) {
+    for _, tok := range tokenizeForLang(d.Title, d.Lang) {
         m, ok := ix.titlePos[tok]
         if !ok { m = map[string][]int{}; ix.titlePos[tok] = m }
         m[d.ID] = append(m[d.ID], p)
@@ -65,9 +227,33 @@ func (ix *Index) Add(d Doc) {
     }
     // snippet positions
     p = 0
-    for _, tok := range tokenize(d.Snippet) {
+    for _, tok := range tokenizeForLang(d.Snippet, d.Lang) {
         m, ok := ix.snippetPos[tok]
         if !ok { m = map[string][]int{}; ix.snippetPos[tok] = m }
+        m[d.ID] = append(m[d.ID], p)
+        p++
+    }
+    // body positions
+    p = 0
+    for _, tok := range tokenizeForLang(d.Body, d.Lang) {
+        m, ok := ix.bodyPos[tok]
+        if !ok { m = map[string][]int{}; ix.bodyPos[tok] = m }
+        m[d.ID] = append(m[d.ID], p)
+        p++
+    }
+    // headings positions
+    p = 0
+    for _, tok := range tokenizeForLang(d.Headings, d.Lang) {
+        m, ok := ix.headingsPos[tok]
+        if !ok { m = map[string][]int{}; ix.headingsPos[tok] = m }
+        m[d.ID] = append(m[d.ID], p)
+        p++
+    }
+    // url tokens (host/path)
+    p = 0
+    for _, tok := range tokenizeURL(d.Url) {
+        m, ok := ix.urlPos[tok]
+        if !ok { m = map[string][]int{}; ix.urlPos[tok] = m }
         m[d.ID] = append(m[d.ID], p)
         p++
     }
@@ -77,16 +263,34 @@ func (ix *Index) Remove(id string) bool {
     d, ok := ix.docs[id]
     if !ok { return false }
     // Remove from position maps
-    for _, tok := range tokenize(d.Title) {
+    for _, tok := range tokenizeForLang(d.Title, d.Lang) {
         if m, ok := ix.titlePos[tok]; ok {
             delete(m, id)
             if len(m) == 0 { delete(ix.titlePos, tok) }
         }
     }
-    for _, tok := range tokenize(d.Snippet) {
+    for _, tok := range tokenizeForLang(d.Snippet, d.Lang) {
         if m, ok := ix.snippetPos[tok]; ok {
             delete(m, id)
             if len(m) == 0 { delete(ix.snippetPos, tok) }
+        }
+    }
+    for _, tok := range tokenizeForLang(d.Body, d.Lang) {
+        if m, ok := ix.bodyPos[tok]; ok {
+            delete(m, id)
+            if len(m) == 0 { delete(ix.bodyPos, tok) }
+        }
+    }
+    for _, tok := range tokenizeForLang(d.Headings, d.Lang) {
+        if m, ok := ix.headingsPos[tok]; ok {
+            delete(m, id)
+            if len(m) == 0 { delete(ix.headingsPos, tok) }
+        }
+    }
+    for _, tok := range tokenizeURL(d.Url) {
+        if m, ok := ix.urlPos[tok]; ok {
+            delete(m, id)
+            if len(m) == 0 { delete(ix.urlPos, tok) }
         }
     }
     delete(ix.docs, id)
@@ -104,14 +308,20 @@ func (ix *Index) Search(q string, limit int) []Result {
     phrases := extractPhrases(q)
     qNoP := removePhrases(q)
     req, opt, not := parseBoolean(qNoP)
+    // build vocabulary once for fuzzy/prefix expansion
+    vocab := ix.vocabulary()
     // candidates
     cand := map[string]bool{}
     if len(req) > 0 {
         first := true
         for tok := range req {
+            // expand token variants (exact/prefix/fuzzy)
+            variants := ix.expandTokenVariants(tok, vocab)
             docsSet := map[string]struct{}{}
-            for id := range ix.titlePos[tok] { docsSet[id] = struct{}{} }
-            for id := range ix.snippetPos[tok] { docsSet[id] = struct{}{} }
+            for vt := range variants {
+                for id := range ix.titlePos[vt] { docsSet[id] = struct{}{} }
+                for id := range ix.snippetPos[vt] { docsSet[id] = struct{}{} }
+            }
             if first {
                 for id := range docsSet { cand[id] = true }
                 first = false
@@ -123,43 +333,60 @@ func (ix *Index) Search(q string, limit int) []Result {
         }
     } else {
         for tok := range opt {
-            for id := range ix.titlePos[tok] { cand[id] = true }
-            for id := range ix.snippetPos[tok] { cand[id] = true }
+            variants := ix.expandTokenVariants(tok, vocab)
+            for vt := range variants {
+                for id := range ix.titlePos[vt] { cand[id] = true }
+                for id := range ix.snippetPos[vt] { cand[id] = true }
+            }
         }
         if len(opt) == 0 {
             for id := range ix.docs { cand[id] = true }
         }
     }
     for tok := range not {
-        for id := range ix.titlePos[tok] { delete(cand, id) }
-        for id := range ix.snippetPos[tok] { delete(cand, id) }
+        // negations apply to all variants as well
+        variants := ix.expandTokenVariants(tok, vocab)
+        for vt := range variants {
+            for id := range ix.titlePos[vt] { delete(cand, id) }
+            for id := range ix.snippetPos[vt] { delete(cand, id) }
+        }
     }
     if len(cand) == 0 { return nil }
     // TF-IDF with field weighting (title > snippet)
     scores := map[string]float64{}
     norms := map[string]float64{}
     N := float64(ix.total)
-    allToks := map[string]struct{}{}
-    for tok := range req { allToks[tok] = struct{}{} }
-    for tok := range opt { allToks[tok] = struct{}{} }
-    if len(allToks) == 0 {
-        for _, t := range tokenize(qNoP) { allToks[t] = struct{}{} }
+    // Use original query tokens, but expand to variants for scoring
+    qTokens := map[string]struct{}{}
+    for tok := range req { qTokens[tok] = struct{}{} }
+    for tok := range opt { qTokens[tok] = struct{}{} }
+    if len(qTokens) == 0 {
+        for _, t := range tokenize(qNoP) { qTokens[t] = struct{}{} }
     }
-    wTitle, wSnip := 2.0, 1.0
-    for tok := range allToks {
-        docsSet := map[string]struct{}{}
-        for id := range ix.titlePos[tok] { docsSet[id] = struct{}{} }
-        for id := range ix.snippetPos[tok] { docsSet[id] = struct{}{} }
-        df := float64(len(docsSet))
-        if df == 0 { continue }
-        idf := math.Log(1 + (N / (1 + df)))
-        for id := range docsSet {
-            if !cand[id] { continue }
-            tfT := float64(len(ix.titlePos[tok][id]))
-            tfS := float64(len(ix.snippetPos[tok][id]))
-            w := (tfT*wTitle + tfS*wSnip) * idf
-            scores[id] += w
-            norms[id] += w * w
+    wTitle, wSnip, wBody, wURL, wHead := 2.0, 1.0, 0.7, 1.2, 1.4
+    for tok := range qTokens {
+        variants := ix.expandTokenVariants(tok, vocab)
+        for vt, mult := range variants {
+            docsSet := map[string]struct{}{}
+            for id := range ix.titlePos[vt] { docsSet[id] = struct{}{} }
+            for id := range ix.snippetPos[vt] { docsSet[id] = struct{}{} }
+            for id := range ix.bodyPos[vt] { docsSet[id] = struct{}{} }
+            for id := range ix.urlPos[vt] { docsSet[id] = struct{}{} }
+            for id := range ix.headingsPos[vt] { docsSet[id] = struct{}{} }
+            df := float64(len(docsSet))
+            if df == 0 { continue }
+            idf := math.Log(1 + (N / (1 + df)))
+            for id := range docsSet {
+                if !cand[id] { continue }
+                tfT := float64(len(ix.titlePos[vt][id]))
+                tfS := float64(len(ix.snippetPos[vt][id]))
+                tfB := float64(len(ix.bodyPos[vt][id]))
+                tfU := float64(len(ix.urlPos[vt][id]))
+                tfH := float64(len(ix.headingsPos[vt][id]))
+                w := (tfT*wTitle + tfS*wSnip + tfB*wBody + tfU*wURL + tfH*wHead) * idf * mult
+                scores[id] += w
+                norms[id] += w * w
+            }
         }
     }
     // Phrase boost
@@ -169,11 +396,11 @@ func (ix *Index) Search(q string, limit int) []Result {
             if ph == "" { continue }
             toks := tokenize(ph)
             if len(toks) == 0 { continue }
-            if hasPhrase(ix.titlePos, id, toks) || hasPhrase(ix.snippetPos, id, toks) {
+            if hasPhrase(ix.titlePos, id, toks) || hasPhrase(ix.snippetPos, id, toks) || hasPhrase(ix.bodyPos, id, toks) || hasPhrase(ix.urlPos, id, toks) || hasPhrase(ix.headingsPos, id, toks) {
                 scores[id] += 2.0 // larger boost for exact phrase
             } else {
                 // fallback substring boost (lower)
-                corpus := strings.ToLower(d.Title + " " + d.Snippet)
+                corpus := strings.ToLower(d.Title + " " + d.Snippet + " " + d.Body + " " + d.Url + " " + d.Headings)
                 if strings.Contains(corpus, strings.ToLower(ph)) { scores[id] += 0.5 }
             }
         }
@@ -182,15 +409,32 @@ func (ix *Index) Search(q string, limit int) []Result {
     for id, sc := range scores {
         n := math.Sqrt(norms[id])
         if n > 0 { sc = sc / n }
-        out = append(out, Result{Doc: ix.docs[id], Score: sc})
+        // apply domain prior multiplier
+        d := ix.docs[id]
+        sc = sc * domainBoostFor(d.Source)
+        out = append(out, Result{Doc: d, Score: sc})
     }
     sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
     if len(out) > limit { out = out[:limit] }
     return out
 }
 
+// SetWeights updates field weights; keys: title, headings, url, snippet, body.
+func SetWeights(m map[string]float64) {
+    for k, v := range m {
+        if v <= 0 { continue }
+        switch strings.ToLower(strings.TrimSpace(k)) {
+        case "title": wTitle = v
+        case "headings": wHead = v
+        case "url": wURL = v
+        case "snippet": wSnip = v
+        case "body": wBody = v
+        }
+    }
+}
+
 // FilteredSearch supports optional source filter, date range, and sort by latest.
-func (ix *Index) FilteredSearch(q string, source string, from string, to string, sortBy string, page int, size int) ([]Result, int, map[string]int64) {
+func (ix *Index) FilteredSearch(q string, source string, lang string, from string, to string, sortBy string, page int, size int) ([]Result, int, map[string]int64) {
     if size <= 0 { size = 10 }
     if page <= 0 { page = 1 }
     results := ix.Search(q, 10000)
@@ -204,6 +448,7 @@ func (ix *Index) FilteredSearch(q string, source string, from string, to string,
     for _, r := range results {
         d := r.Doc
         if source != "" && d.Source != source { continue }
+        if lang != "" && strings.ToLower(strings.TrimSpace(d.Lang)) != strings.ToLower(strings.TrimSpace(lang)) { continue }
         if hasFrom || hasTo {
             if dt, err := parseDate(d.Date); err == nil {
                 if hasFrom && dt.Before(fromT) { continue }
@@ -225,13 +470,15 @@ func (ix *Index) FilteredSearch(q string, source string, from string, to string,
             return ti.After(tj)
         })
     }
-    total := len(filtered)
+    // Diversify by source domain
+    diversified := diversifyBySource(filtered, maxPerSource)
+    total := len(diversified)
     // Pagination
     start := (page - 1) * size
     if start > total { return []Result{}, total, facets }
     end := start + size
     if end > total { end = total }
-    return filtered[start:end], total, facets
+    return diversified[start:end], total, facets
 }
 
 func parseDate(s string) (time.Time, error) {
@@ -333,6 +580,9 @@ func (ix *Index) Load(path string) error {
     ix.docs = map[string]Doc{}
     ix.titlePos = map[string]map[string][]int{}
     ix.snippetPos = map[string]map[string][]int{}
+    ix.bodyPos = map[string]map[string][]int{}
+    ix.urlPos = map[string]map[string][]int{}
+    ix.headingsPos = map[string]map[string][]int{}
     ix.total = 0
     for _, d := range snap.Docs { ix.Add(d) }
     return nil
@@ -375,6 +625,21 @@ func (ix *Index) List(offset, limit int) []Doc {
     return out
 }
 
+// diversifyBySource caps the number of results per source while preserving order.
+func diversifyBySource(in []Result, maxPer int) []Result {
+    if maxPer <= 0 { return in }
+    out := make([]Result, 0, len(in))
+    per := map[string]int{}
+    for _, r := range in {
+        s := r.Doc.Source
+        if per[s] < maxPer {
+            out = append(out, r)
+            per[s] = per[s] + 1
+        }
+    }
+    return out
+}
+
 // ExportDocs returns a copy of all docs for snapshot/export.
 func (ix *Index) ExportDocs() []Doc {
     docs := make([]Doc, 0, len(ix.docs))
@@ -387,6 +652,9 @@ func (ix *Index) ReplaceAll(docs []Doc) {
     ix.docs = map[string]Doc{}
     ix.titlePos = map[string]map[string][]int{}
     ix.snippetPos = map[string]map[string][]int{}
+    ix.bodyPos = map[string]map[string][]int{}
+    ix.urlPos = map[string]map[string][]int{}
+    ix.headingsPos = map[string]map[string][]int{}
     ix.total = 0
     for _, d := range docs { ix.Add(d) }
 }
@@ -402,6 +670,101 @@ func (ix *Index) ClearBy(source, host string) int {
         if ix.Remove(id) { removed++ }
     }
     return removed
+}
+
+// vocabulary returns a set of all tokens present in the index across fields.
+func (ix *Index) vocabulary() map[string]struct{} {
+    vocab := map[string]struct{}{}
+    for t := range ix.titlePos { vocab[t] = struct{}{} }
+    for t := range ix.snippetPos { vocab[t] = struct{}{} }
+    for t := range ix.bodyPos { vocab[t] = struct{}{} }
+    for t := range ix.urlPos { vocab[t] = struct{}{} }
+    for t := range ix.headingsPos { vocab[t] = struct{}{} }
+    return vocab
+}
+
+// tokenizeURL extracts tokens from host and path of a URL.
+func tokenizeURL(u string) []string {
+    if u == "" { return nil }
+    // Lowercase and ASCII-fold then split by non-alnum
+    s := normalize(u)
+    parts := strings.Fields(s)
+    out := make([]string, 0, len(parts))
+    for _, p := range parts {
+        if len(p) < 2 { continue }
+        out = append(out, p)
+    }
+    return out
+}
+
+// expandTokenVariants returns candidate index tokens for a given query token with weights.
+// Always includes the exact token (weight 1). May include prefix (weight 0.7) and fuzzy (weight 0.5) variants.
+func (ix *Index) expandTokenVariants(tok string, vocab map[string]struct{}) map[string]float64 {
+    out := map[string]float64{}
+    out[tok] = 1.0
+    l := len(tok)
+    // Prefix expansion
+    if enablePrefix && l >= prefixMinLen {
+        for v := range vocab {
+            if strings.HasPrefix(v, tok) {
+                // skip exact (already present)
+                if _, ok := out[v]; !ok {
+                    weight := 0.7
+                    if l <= 2 { weight = 0.4 }
+                    out[v] = weight
+                }
+            }
+        }
+    }
+    // Fuzzy expansion: only if we have no exact or prefix hits
+    if enableFuzzy && l >= 3 {
+        // count matches so far excluding the original token
+        hasAlt := false
+        for v := range out { if v != tok { hasAlt = true; break } }
+        if !hasAlt {
+            for v := range vocab {
+                if v == tok { continue }
+                if editDistanceLeq1(tok, v) { out[v] = 0.5 }
+            }
+        }
+    }
+    // Synonyms expansion (from in-memory dictionary)
+    for _, syn := range synonyms(tok) {
+        if _, ok := out[syn]; !ok { out[syn] = 0.8 }
+    }
+    return out
+}
+
+// synonyms returns a small set of hand-curated aliases.
+func synonyms(tok string) []string {
+    t := strings.ToLower(strings.TrimSpace(tok))
+    if t == "" { return nil }
+    if arr, ok := synonymsMap[t]; ok { return arr }
+    return nil
+}
+
+// editDistanceLeq1 returns true if Levenshtein distance between a and b is <= 1.
+func editDistanceLeq1(a, b string) bool {
+    if a == b { return true }
+    la, lb := len(a), len(b)
+    if la-lb > 1 || lb-la > 1 { return false }
+    i, j := 0, 0
+    edits := 0
+    for i < la && j < lb {
+        if a[i] == b[j] { i++; j++; continue }
+        edits++
+        if edits > 1 { return false }
+        if la == lb { // substitution
+            i++; j++
+        } else if la > lb { // deletion in a
+            i++
+        } else { // insertion in a
+            j++
+        }
+    }
+    // account for trailing extra char
+    if i < la || j < lb { edits++ }
+    return edits <= 1
 }
 
 func hostOf(u string) string {
