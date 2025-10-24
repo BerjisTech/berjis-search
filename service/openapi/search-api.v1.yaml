@@ -1,0 +1,98 @@
+openapi: 3.0.3
+info:
+  title: Berjis Search API
+  version: 1.0.0
+servers:
+  - url: http://search-api.berjis.test
+paths:
+  /v1/health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+  /v1/search:
+    get:
+      summary: Search
+      parameters:
+        - in: query
+          name: q
+          schema: { type: string }
+        - in: query
+          name: type
+          schema: { type: string, enum: [all, images, videos, news, forums, books, map, finance] }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [relevance, latest] }
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: source
+          schema: { type: string }
+        - in: query
+          name: from
+          description: Filter results from this date (YYYY-MM-DD or RFC3339)
+          schema: { type: string }
+        - in: query
+          name: to
+          description: Filter results up to this date (YYYY-MM-DD or RFC3339)
+          schema: { type: string }
+      responses:
+        '200':
+          description: Results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      q: { type: string }
+                      type: { type: string }
+                      sort: { type: string }
+                      page: { type: integer }
+                      total: { type: integer }
+                      facets:
+                        type: object
+                        additionalProperties:
+                          type: object
+                          additionalProperties: { type: integer }
+                      results:
+                        type: array
+                        items:
+                          oneOf:
+                            - $ref: '#/components/schemas/Web'
+                            - $ref: '#/components/schemas/Image'
+                            - $ref: '#/components/schemas/Video'
+  /v1/admin/index/seed:
+    post:
+      summary: Seed demo index data
+      responses:
+        '200':
+          description: Seeded
+components:
+  schemas:
+    Web:
+      type: object
+      properties:
+        Title: { type: string }
+        Url: { type: string }
+        Snippet: { type: string }
+        Source: { type: string }
+    Image:
+      type: object
+      properties:
+        Title: { type: string }
+        ThumbnailUrl: { type: string }
+        ImageUrl: { type: string }
+        Source: { type: string }
+    Video:
+      type: object
+      properties:
+        Title: { type: string }
+        Url: { type: string }
+        Duration: { type: string }
+        Source: { type: string }
