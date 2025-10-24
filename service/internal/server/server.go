@@ -1,15 +1,13 @@
 package server
 
 import (
-    "log"
+    "path/filepath"
     "strconv"
     "strings"
-
     "github.com/gofiber/fiber/v2"
     spec "github.com/berjistech/berjis-ecosystem/search/service/openapi"
     "github.com/berjistech/berjis-ecosystem/search/service/internal/searchindex"
     "github.com/berjistech/berjis-ecosystem/search/service/internal/config"
-    search "github.com/berjistech/berjis-ecosystem/search/service/internal/search"
 )
 
 type Options struct {
@@ -18,13 +16,13 @@ type Options struct {
 
 func New(opts Options) *fiber.App {
     app := fiber.New()
-    ix := searchindex.New()
     cfg := config.Load()
-    var meili *search.Meili
-    if cfg.MeiliHost != "" {
-        meili = search.NewMeili(cfg.MeiliHost, cfg.MeiliAPIKey)
-        log.Printf("search: using meilisearch at %s", cfg.MeiliHost)
-    }
+    store := searchindex.NewStore()
+    // Load persisted indexes if available
+    _ = store.Web.Load(filepath.Join(cfg.PersistDir, "web.json"))
+    _ = store.Images.Load(filepath.Join(cfg.PersistDir, "images.json"))
+    _ = store.Videos.Load(filepath.Join(cfg.PersistDir, "videos.json"))
+    _ = store.News.Load(filepath.Join(cfg.PersistDir, "news.json"))
 
     // CORS allowlist (reflect origin) for berjis.test and subdomains
     app.Use(func(c *fiber.Ctx) error {
@@ -73,9 +71,9 @@ func New(opts Options) *fiber.App {
         return c.SendString(html)
     })
 
-    // Seed demo documents into in-memory index or Meili
+    // Seed demo documents into in-memory index
     app.Post("/v1/admin/index/seed", func(c *fiber.Ctx) error {
-        demo := []search.WebDoc{
+        demo := []searchindex.Doc{
             { ID: "1", Title: "Berjis – Unified Ecosystem", Url: "http://berjis.test", Snippet: "Suite of interconnected apps with single sign-on.", Source: "berjis.test" },
             { ID: "2", Title: "Logistics", Url: "http://logistics.berjis.test", Snippet: "Logistics platform for supply chain actors.", Source: "logistics.berjis.test" },
             { ID: "3", Title: "Docs", Url: "http://docs.berjis.test", Snippet: "Create and collaborate on documents.", Source: "docs.berjis.test" },
@@ -85,14 +83,184 @@ func New(opts Options) *fiber.App {
             { ID: "7", Title: "Communities", Url: "http://communities.berjis.test", Snippet: "Join discussions and groups.", Source: "communities.berjis.test" },
             { ID: "8", Title: "Architect", Url: "http://architect.berjis.test", Snippet: "Design and architecture suite.", Source: "architect.berjis.test" },
         }
-        if meili != nil {
-            if err := meili.IndexWeb(demo); err != nil {
-                return c.Status(500).JSON(fiber.Map{"success": false, "message": err.Error()})
-            }
-            return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"seeded": len(demo), "backend": "meilisearch"}})
-        }
-        for _, d := range demo { ix.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Snippet, Source: d.Source}) }
+        for _, d := range demo { store.Web.Add(d) }
+        _ = store.Web.Save(filepath.Join(cfg.PersistDir, "web.json"))
         return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"seeded": len(demo), "backend": "memory"}})
+    })
+
+    // Inspection: stats per vertical
+    app.Get("/v1/admin/index/:vertical/stats", func(c *fiber.Ctx) error {
+        v := c.Params("vertical")
+        var ix *searchindex.Index
+        switch v {
+        case "web": ix = store.Web
+        case "images": ix = store.Images
+        case "videos": ix = store.Videos
+        case "news": ix = store.News
+        default: return c.Status(400).JSON(fiber.Map{"success": false, "message": "unknown vertical"})
+        }
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"total": ix.Total(), "facets": fiber.Map{"source": ix.FacetSource()}}})
+    })
+    // Inspection: list docs
+    app.Get("/v1/admin/index/:vertical/docs", func(c *fiber.Ctx) error {
+        v := c.Params("vertical")
+        offset, _ := strconv.Atoi(c.Query("offset", "0"))
+        limit, _ := strconv.Atoi(c.Query("limit", "50"))
+        var ix *searchindex.Index
+        switch v {
+        case "web": ix = store.Web
+        case "images": ix = store.Images
+        case "videos": ix = store.Videos
+        case "news": ix = store.News
+        default: return c.Status(400).JSON(fiber.Map{"success": false, "message": "unknown vertical"})
+        }
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"items": ix.List(offset, limit), "total": ix.Total()}})
+    })
+    // Removal: delete by id
+    app.Delete("/v1/admin/index/:vertical/:id", func(c *fiber.Ctx) error {
+        v := c.Params("vertical")
+        id := c.Params("id")
+        var ix *searchindex.Index
+        var snap string
+        switch v {
+        case "web": ix = store.Web; snap = "web.json"
+        case "images": ix = store.Images; snap = "images.json"
+        case "videos": ix = store.Videos; snap = "videos.json"
+        case "news": ix = store.News; snap = "news.json"
+        default: return c.Status(400).JSON(fiber.Map{"success": false, "message": "unknown vertical"})
+        }
+        ok := ix.Remove(id)
+        if !ok { return c.Status(404).JSON(fiber.Map{"success": false, "message": "not found"}) }
+        _ = ix.Save(filepath.Join(cfg.PersistDir, snap))
+        return c.JSON(fiber.Map{"success": true})
+    })
+
+    // Clear by filters: source and/or host
+    app.Post("/v1/admin/index/:vertical/clear", func(c *fiber.Ctx) error {
+        v := c.Params("vertical")
+        source := c.Query("source", "")
+        host := c.Query("host", "")
+        var ix *searchindex.Index
+        var snap string
+        switch v {
+        case "web": ix = store.Web; snap = "web.json"
+        case "images": ix = store.Images; snap = "images.json"
+        case "videos": ix = store.Videos; snap = "videos.json"
+        case "news": ix = store.News; snap = "news.json"
+        default: return c.Status(400).JSON(fiber.Map{"success": false, "message": "unknown vertical"})
+        }
+        n := ix.ClearBy(source, host)
+        _ = ix.Save(filepath.Join(cfg.PersistDir, snap))
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"cleared": n}})
+    })
+
+    // Export snapshot (JSON)
+    app.Get("/v1/admin/index/:vertical/export", func(c *fiber.Ctx) error {
+        v := c.Params("vertical")
+        var ix *searchindex.Index
+        switch v {
+        case "web": ix = store.Web
+        case "images": ix = store.Images
+        case "videos": ix = store.Videos
+        case "news": ix = store.News
+        default: return c.Status(400).JSON(fiber.Map{"success": false, "message": "unknown vertical"})
+        }
+        docs := ix.ExportDocs()
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"docs": docs, "total": len(docs)}})
+    })
+
+    // Import snapshot (JSON)
+    app.Post("/v1/admin/index/:vertical/import", func(c *fiber.Ctx) error {
+        v := c.Params("vertical")
+        var ix *searchindex.Index
+        var snap string
+        switch v {
+        case "web": ix = store.Web; snap = "web.json"
+        case "images": ix = store.Images; snap = "images.json"
+        case "videos": ix = store.Videos; snap = "videos.json"
+        case "news": ix = store.News; snap = "news.json"
+        default: return c.Status(400).JSON(fiber.Map{"success": false, "message": "unknown vertical"})
+        }
+        // Accept either {docs:[...]} or just [...] array
+        var body struct{ Docs []searchindex.Doc `json:"docs"` }
+        if err := c.BodyParser(&body); err != nil {
+            // try raw array
+            var arr []searchindex.Doc
+            if err2 := c.BodyParser(&arr); err2 != nil {
+                return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"})
+            }
+            ix.ReplaceAll(arr)
+        } else {
+            ix.ReplaceAll(body.Docs)
+        }
+        _ = ix.Save(filepath.Join(cfg.PersistDir, snap))
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"total": ix.Total()}})
+    })
+
+    // Reindex: rebuild postings from either disk (default) or current memory
+    // Body optional: { from: "disk" | "memory" }
+    app.Post("/v1/admin/index/:vertical/reindex", func(c *fiber.Ctx) error {
+        v := c.Params("vertical")
+        var ix *searchindex.Index
+        var snap string
+        switch v {
+        case "web": ix = store.Web; snap = "web.json"
+        case "images": ix = store.Images; snap = "images.json"
+        case "videos": ix = store.Videos; snap = "videos.json"
+        case "news": ix = store.News; snap = "news.json"
+        default: return c.Status(400).JSON(fiber.Map{"success": false, "message": "unknown vertical"})
+        }
+        var body struct{ From string `json:"from"` }
+        _ = c.BodyParser(&body)
+        from := strings.ToLower(strings.TrimSpace(body.From))
+        if from == "memory" {
+            docs := ix.ExportDocs()
+            ix.ReplaceAll(docs)
+        } else {
+            // default: disk
+            if err := ix.Load(filepath.Join(cfg.PersistDir, snap)); err != nil {
+                return c.Status(500).JSON(fiber.Map{"success": false, "message": "load error"})
+            }
+        }
+        // persist rebuilt snapshot
+        _ = ix.Save(filepath.Join(cfg.PersistDir, snap))
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"total": ix.Total(), "from": map[bool]string{true:"memory", false:"disk"}[from=="memory"]}})
+    })
+
+    type BulkWeb struct { Docs []searchindex.Doc `json:"docs"` }
+    app.Post("/v1/admin/index/web", func(c *fiber.Ctx) error {
+        var body BulkWeb
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        for _, d := range body.Docs { store.Web.Add(d) }
+        _ = store.Web.Save(filepath.Join(cfg.PersistDir, "web.json"))
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
+    })
+    type ImageDoc struct { ID, Title, ThumbnailUrl, ImageUrl, Source, Date string }
+    type BulkImages struct { Docs []ImageDoc `json:"docs"` }
+    app.Post("/v1/admin/index/images", func(c *fiber.Ctx) error {
+        var body BulkImages
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        for _, d := range body.Docs { store.Images.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.ImageUrl, Snippet: d.ThumbnailUrl, Source: d.Source, Date: d.Date}) }
+        _ = store.Images.Save(filepath.Join(cfg.PersistDir, "images.json"))
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
+    })
+    type VideoDoc struct { ID, Title, Url, Duration, Source, Date string }
+    type BulkVideos struct { Docs []VideoDoc `json:"docs"` }
+    app.Post("/v1/admin/index/videos", func(c *fiber.Ctx) error {
+        var body BulkVideos
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        for _, d := range body.Docs { store.Videos.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Duration, Source: d.Source, Date: d.Date}) }
+        _ = store.Videos.Save(filepath.Join(cfg.PersistDir, "videos.json"))
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
+    })
+    type NewsDoc struct { ID, Title, Url, Snippet, Source, Date string }
+    type BulkNews struct { Docs []NewsDoc `json:"docs"` }
+    app.Post("/v1/admin/index/news", func(c *fiber.Ctx) error {
+        var body BulkNews
+        if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
+        for _, d := range body.Docs { store.News.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Snippet, Source: d.Source, Date: d.Date}) }
+        _ = store.News.Save(filepath.Join(cfg.PersistDir, "news.json"))
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
     })
 
     // Query serving endpoint
@@ -110,26 +278,15 @@ func New(opts Options) *fiber.App {
             return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": 0, "results": []any{}}})
         }
 
-        // If searching 'all', try Meili; fallback to in-memory index results
+        // 'all' → web index search with filters
         if typ == "all" {
-            if meili != nil {
-                wr, err := meili.SearchWeb(q, page, 10, sourceF, from, to, sort)
-                if err == nil && len(wr.Hits) > 0 {
-                    type Web struct{ Title, Url, Snippet, Source string }
-                    out := make([]Web, 0, len(wr.Hits))
-                    for _, r := range wr.Hits { out = append(out, Web{ Title: r.Title, Url: r.Url, Snippet: r.Snippet, Source: r.Source }) }
-                    return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": wr.Total, "results": out, "facets": wr.Facets}})
-                }
+            found, total, facets := store.Web.FilteredSearch(q, sourceF, from, to, sort, page, 10)
+            type Web struct{ Title, Url, Snippet, Source string }
+            out := make([]Web, 0, len(found))
+            for _, r := range found {
+                out = append(out, Web{Title: r.Doc.Title, Url: r.Doc.Url, Snippet: highlight(r.Doc.Snippet, q), Source: r.Doc.Source})
             }
-            found := ix.Search(q, 10)
-            if len(found) > 0 {
-                type Web struct{ Title, Url, Snippet, Source string }
-                out := make([]Web, 0, len(found))
-                for _, r := range found {
-                    out = append(out, Web{ Title: r.Doc.Title, Url: r.Doc.Url, Snippet: r.Doc.Snippet, Source: r.Doc.Source })
-                }
-                return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": len(out), "results": out}})
-            }
+            return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": total, "results": out, "facets": fiber.Map{"source": facets}}})
         }
 
         // Placeholder results; swap with real index/metasearch later
@@ -141,38 +298,20 @@ func New(opts Options) *fiber.App {
 
         switch typ {
         case "images":
-            if meili != nil {
-                ir, err := meili.SearchImages(q, page, 30, sourceF, from, to, sort)
-                if err == nil {
-                    out := make([]Image, 0, len(ir.Hits))
-                    for _, r := range ir.Hits { out = append(out, Image{ Title: r.Title, ThumbnailUrl: r.ThumbnailUrl, ImageUrl: r.ImageUrl, Source: r.Source }) }
-                    return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": ir.Total, "results": out, "facets": ir.Facets}})
-                }
-            }
-            results = []Image{{ Title: "Berjis Logo", ThumbnailUrl: "http://berjis.test/static/logo-128.png", ImageUrl: "http://berjis.test/static/logo.png", Source: "berjis.test" }}
-            total = 1
+            found, totalCount, facets := store.Images.FilteredSearch(q, sourceF, from, to, sort, page, 30)
+            out := make([]Image, 0, len(found))
+            for _, r := range found { out = append(out, Image{ Title: r.Doc.Title, ThumbnailUrl: r.Doc.Snippet, ImageUrl: r.Doc.Url, Source: r.Doc.Source }) }
+            return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": out, "facets": fiber.Map{"source": facets}}})
         case "videos":
-            if meili != nil {
-                vr, err := meili.SearchVideos(q, page, 10, sourceF, from, to, sort)
-                if err == nil {
-                    out := make([]Video, 0, len(vr.Hits))
-                    for _, r := range vr.Hits { out = append(out, Video{ Title: r.Title, Url: r.Url, Duration: r.Duration, Source: r.Source }) }
-                    return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": vr.Total, "results": out, "facets": vr.Facets}})
-                }
-            }
-            results = []Video{{ Title: "Introducing Berjis Logistics", Url: "http://logistics.berjis.test", Duration: "2:03", Source: "logistics.berjis.test" }}
-            total = 1
+            found, totalCount, facets := store.Videos.FilteredSearch(q, sourceF, from, to, sort, page, 10)
+            outV := make([]Video, 0, len(found))
+            for _, r := range found { outV = append(outV, Video{ Title: r.Doc.Title, Url: r.Doc.Url, Duration: r.Doc.Snippet, Source: r.Doc.Source }) }
+            return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": outV, "facets": fiber.Map{"source": facets}}})
         case "news":
-            if meili != nil {
-                nr, err := meili.SearchNews(q, page, 10, sourceF, from, to, sort)
-                if err == nil {
-                    out := make([]Web, 0, len(nr.Hits))
-                    for _, r := range nr.Hits { out = append(out, Web{ Title: r.Title, Url: r.Url, Snippet: r.Snippet, Source: r.Source }) }
-                    return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": nr.Total, "results": out, "facets": nr.Facets}})
-                }
-            }
-            results = []Web{{ Title: "Berjis announces Logistics beta", Url: "http://berjis.test", Snippet: "Early access to unified logistics platform.", Source: "berjis.test" }}
-            total = 1
+            found, totalCount, facets := store.News.FilteredSearch(q, sourceF, from, to, sort, page, 10)
+            outN := make([]Web, 0, len(found))
+            for _, r := range found { outN = append(outN, Web{ Title: r.Doc.Title, Url: r.Doc.Url, Snippet: highlight(r.Doc.Snippet, q), Source: r.Doc.Source }) }
+            return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": outN, "facets": fiber.Map{"source": facets}}})
         case "forums":
             results = []Web{
                 { Title: "Communities: Discuss Berjis", Url: "http://communities.berjis.test", Snippet: "Join conversations about the Berjis ecosystem.", Source: "communities.berjis.test" },
@@ -212,3 +351,60 @@ func New(opts Options) *fiber.App {
 
     return app
 }
+
+// highlight applies simple <mark> tags for query terms and phrases in a snippet.
+func highlight(snippet string, q string) string {
+    if strings.TrimSpace(snippet) == "" { return snippet }
+    toks := searchindex.TokenizePublic(q)
+    phrases := searchindex.ExtractPhrasesPublic(q)
+    words := strings.Fields(snippet)
+    hitIdx := -1
+    lowerSnippet := strings.ToLower(snippet)
+    for _, ph := range phrases {
+        if ph == "" { continue }
+        if strings.Contains(lowerSnippet, strings.ToLower(ph)) {
+            for i, w := range words {
+                if strings.Contains(strings.ToLower(w), strings.ToLower(ph)) { hitIdx = i; break }
+            }
+            if hitIdx != -1 { break }
+        }
+    }
+    if hitIdx == -1 {
+        for i, w := range words {
+            lw := strings.ToLower(w)
+            for _, t := range toks { if t != "" && strings.Contains(lw, t) { hitIdx = i; break } }
+            if hitIdx != -1 { break }
+        }
+    }
+    start := 0
+    if hitIdx > 0 { start = hitIdx - 12; if start < 0 { start = 0 } }
+    end := len(words)
+    if start+24 < end { end = start + 24 }
+    slice := words[start:end]
+    s := strings.Join(slice, " ")
+    // Mark placeholders, then escape HTML, then replace placeholders with tags
+    const mkStart = "\u0000MK_S\u0000"
+    const mkEnd = "\u0000MK_E\u0000"
+    for _, ph := range phrases { if ph != "" { s = strings.ReplaceAll(s, ph, mkStart+ph+mkEnd) } }
+    for _, tok := range toks { if tok != "" { s = strings.ReplaceAll(s, tok, mkStart+tok+mkEnd) } }
+    s = escapeHTML(s)
+    s = strings.ReplaceAll(s, escapeHTML(mkStart), "<mark>")
+    s = strings.ReplaceAll(s, escapeHTML(mkEnd), "</mark>")
+    if start > 0 { s = "… " + s }
+    if end < len(words) { s = s + " …" }
+    return s
+}
+
+func escapeHTML(s string) string {
+    r := strings.NewReplacer(
+        "&", "&amp;",
+        "<", "&lt;",
+        ">", "&gt;",
+        "\"", "&quot;",
+        "'", "&#39;",
+    )
+    return r.Replace(s)
+}
+
+// small adapters to access tokenizer/phrase functions without exporting them
+func searchindexExtractPhrases(s string) []string { return searchindex.ExtractPhrasesPublic(s) }

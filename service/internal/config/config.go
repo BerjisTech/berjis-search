@@ -8,8 +8,7 @@ type Config struct {
     Env            string
     Port           string
     AllowedOrigins string
-    MeiliHost      string
-    MeiliAPIKey    string
+    PersistDir     string
 }
 
 func getenv(k, def string) string {
@@ -22,7 +21,6 @@ func Load() Config {
         Env: getenv("APP_ENV", "development"),
         Port: getenv("PORT", "8092"),
         AllowedOrigins: getenv("ALLOWED_ORIGINS", "http://berjis.test"),
-        MeiliHost: getenv("MEILI_HOST", "http://meilisearch:7700"),
-        MeiliAPIKey: getenv("MEILI_API_KEY", "devkey"),
+        PersistDir: getenv("PERSIST_DIR", "/data/search"),
     }
 }
