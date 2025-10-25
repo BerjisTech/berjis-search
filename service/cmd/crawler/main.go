@@ -17,6 +17,7 @@ import (
 
     "github.com/berjistech/berjis-ecosystem/search/service/internal/config"
     whatlang "github.com/abadojack/whatlanggo"
+    "sync"
 )
 
 type item struct{ u string; depth int }
@@ -74,110 +75,161 @@ func main() {
     seen := map[string]bool{}
     // Load previous frontier
     loadFrontier(frontierPath, &q, &seen)
-    // Merge in seeds at depth 0
-    for _, s := range seeds { s = strings.TrimSpace(s); if s != "" && !seen[s] { q = append(q, item{u: s, depth: 0}) } }
+    // Merge in seeds at depth 0 (mark as seen when queued)
+    for _, s := range seeds {
+        s = strings.TrimSpace(s)
+        if s != "" && !seen[s] { seen[s] = true; q = append(q, item{u: s, depth: 0}) }
+    }
+    // Batching with mutex (for concurrent workers)
+    var batchMu sync.Mutex
     webBatch := []WebDoc{}
     imgBatch := []map[string]string{}
     vidBatch := []map[string]string{}
     newsBatch := []map[string]string{}
     batchSize := atoi(getenv("BATCH_SIZE", "100"))
     if batchSize <= 0 { batchSize = 100 }
-    count := 0
+    addWeb := func(d WebDoc) {
+        batchMu.Lock(); defer batchMu.Unlock()
+        webBatch = append(webBatch, d)
+        if len(webBatch) >= batchSize { postJSON(base+"/v1/admin/index/web", map[string]any{"docs": webBatch}); webBatch = webBatch[:0] }
+    }
+    addImg := func(m map[string]string) {
+        batchMu.Lock(); defer batchMu.Unlock()
+        imgBatch = append(imgBatch, m)
+        if len(imgBatch) >= batchSize { postJSON(base+"/v1/admin/index/images", map[string]any{"docs": imgBatch}); imgBatch = imgBatch[:0] }
+    }
+    addVid := func(m map[string]string) {
+        batchMu.Lock(); defer batchMu.Unlock()
+        vidBatch = append(vidBatch, m)
+        if len(vidBatch) >= batchSize { postJSON(base+"/v1/admin/index/videos", map[string]any{"docs": vidBatch}); vidBatch = vidBatch[:0] }
+    }
+    addNews := func(m map[string]string) {
+        batchMu.Lock(); defer batchMu.Unlock()
+        newsBatch = append(newsBatch, m)
+        if len(newsBatch) >= batchSize { postJSON(base+"/v1/admin/index/news", map[string]any{"docs": newsBatch}); newsBatch = newsBatch[:0] }
+    }
+
+    // Shared state for robots and per-host bookkeeping
+    var mu sync.Mutex
     hostPolicy := map[string]policy{}
     hostNext := map[string]time.Time{}
     hostCount := map[string]int{}
     hostBlocked := map[string]int{}
     hostLast := map[string]string{}
+    processed := 0
     maxPerHost := atoi(getenv("MAX_PER_HOST", "20"))
     ua := getenv("CRAWLER_USER_AGENT", "BerjisBot/1.0")
     robotsUA := getenv("ROBOTS_USER_AGENT", "BerjisBot")
     client := &http.Client{ Timeout: 20 * time.Second }
-    for len(q) > 0 && count < maxPages {
-        it := q[0]; q = q[1:]
-        u := it.u
-        if seen[u] { continue }
-        seen[u] = true
-        count++
-        h := hostOf(u)
-        // robots.txt
-        pol := hostPolicy[h]
-        if !pol.inited {
-            pol = fetchRobots(client, h, robotsUA)
-            hostPolicy[h] = pol
+    maxWorkers := atoi(getenv("MAX_WORKERS", "16"))
+    if maxWorkers <= 0 { maxWorkers = 16 }
+    sem := make(chan struct{}, maxWorkers)
+    inflight := 0
+    for (len(q) > 0 || inflight > 0) && processed < maxPages {
+        if len(q) == 0 {
+            time.Sleep(20 * time.Millisecond)
+            continue
         }
-        if !pol.allowed(u) { hostBlocked[h] = hostBlocked[h] + 1; continue }
-        // per-host crawl delay
-        if nxt := hostNext[h]; time.Now().Before(nxt) {
-            time.Sleep(nxt.Sub(time.Now()))
-        }
-        if maxPerHost > 0 && hostCount[h] >= maxPerHost { continue }
-        html, status := fetchHTML(client, ua, u)
-        if status >= 400 || html == "" { continue }
-        if pol.delay > 0 { hostNext[h] = time.Now().Add(pol.delay) }
-        hostCount[h] = hostCount[h] + 1
-        hostLast[h] = time.Now().UTC().Format(time.RFC3339)
-        title, desc := extractTitleDesc(html)
-        if title == "" { title = u }
-        if desc == "" { desc = title }
-        body := extractMainText(html)
-        headings := extractHeadings(html)
-        lang := detectLang(title+" "+desc+" "+body)
-        now := time.Now().UTC().Format(time.RFC3339)
-        id := fmt.Sprintf("%x", sha1.Sum([]byte(u)))
-        webBatch = append(webBatch, WebDoc{ID: id, Title: title, Url: u, Snippet: desc, Body: body, Headings: headings, Source: hostOf(u), Date: now, Lang: lang})
-        if len(webBatch) >= batchSize {
-            postJSON(base+"/v1/admin/index/web", map[string]any{"docs": webBatch})
-            webBatch = webBatch[:0]
-        }
-        // OG image/video
-        if img := firstGroup(reMetaOGImg.FindStringSubmatch(html)); img != "" {
-            ai := absURL(u, img)
-            imgBatch = append(imgBatch, map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(ai))), "title": title, "thumbnailUrl": ai, "imageUrl": ai, "source": hostOf(ai), "date": now})
-            if len(imgBatch) >= batchSize { postJSON(base+"/v1/admin/index/images", map[string]any{"docs": imgBatch}); imgBatch = imgBatch[:0] }
-        }
-        if vid := firstGroup(reMetaOGVid.FindStringSubmatch(html)); vid != "" {
-            av := absURL(u, vid)
-            vidBatch = append(vidBatch, map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(av))), "title": title, "url": av, "duration": "", "source": hostOf(av), "date": now})
-            if len(vidBatch) >= batchSize { postJSON(base+"/v1/admin/index/videos", map[string]any{"docs": vidBatch}); vidBatch = vidBatch[:0] }
-        }
-        // News detection
-        ogType := strings.ToLower(firstGroup(reMetaOGType.FindStringSubmatch(html)))
-        if ogType == "article" {
-            pub := firstGroup(reMetaArtPub.FindStringSubmatch(html))
-            if pub == "" { pub = now }
-            newsBatch = append(newsBatch, map[string]string{"id": id, "title": title, "url": u, "snippet": desc, "source": hostOf(u), "date": pub})
-        }
-        // Images from <img>
-        for _, m := range reImgTags.FindAllStringSubmatch(html, -1) {
-            src := absURL(u, m[1])
-            if src == "" { continue }
-            imgBatch = append(imgBatch, map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(src))), "title": title, "thumbnailUrl": src, "imageUrl": src, "source": hostOf(src), "date": now})
-        }
-        // Enqueue links
-        if it.depth < maxDepth {
-            for _, m := range reLinks.FindAllStringSubmatch(html, -1) {
-                href := absURL(u, m[1])
-                if href == "" { continue }
-                if sameDomain && !allowed[hostOf(href)] { continue }
-                if !seen[href] { q = append(q, item{u: href, depth: it.depth + 1}) }
+        it := q[0]
+        q = q[1:]
+        processed++
+        sem <- struct{}{}
+        mu.Lock(); inflight++ ; mu.Unlock()
+        go func(it item) {
+            defer func(){ <-sem; mu.Lock(); inflight--; mu.Unlock() }()
+            u := it.u
+            h := hostOf(u)
+            if h == "" { return }
+            // robots and limits
+            mu.Lock()
+            pol := hostPolicy[h]
+            mu.Unlock()
+            if !pol.inited {
+                pol = fetchRobots(client, h, robotsUA)
+                mu.Lock(); hostPolicy[h] = pol; mu.Unlock()
             }
-        }
-        // Sitemap discovery via robots
-        if len(pol.sitemaps) > 0 {
-            for _, sm := range pol.sitemaps {
-                urls := fetchSitemap(client, sm)
-                for _, su := range urls {
-                    if sameDomain && !allowed[hostOf(su)] { continue }
-                    if !seen[su] { q = append(q, item{u: su, depth: it.depth + 1}) }
+            if !pol.allowed(u) { mu.Lock(); hostBlocked[h] = hostBlocked[h] + 1; mu.Unlock(); return }
+            mu.Lock()
+            if nxt := hostNext[h]; time.Now().Before(nxt) {
+                d := nxt.Sub(time.Now()); mu.Unlock(); if d > 0 { time.Sleep(d) }; mu.Lock()
+            }
+            if maxPerHost > 0 && hostCount[h] >= maxPerHost { mu.Unlock(); return }
+            mu.Unlock()
+
+            html, status := fetchHTML(client, ua, u)
+            if status >= 400 || html == "" { return }
+            mu.Lock()
+            if pol.delay > 0 { hostNext[h] = time.Now().Add(pol.delay) }
+            hostCount[h] = hostCount[h] + 1
+            hostLast[h] = time.Now().UTC().Format(time.RFC3339)
+            mu.Unlock()
+
+            title, desc := extractTitleDesc(html)
+            if title == "" { title = u }
+            if desc == "" { desc = title }
+            body := extractMainText(html)
+            headings := extractHeadings(html)
+            lang := detectLang(title+" "+desc+" "+body)
+            now := time.Now().UTC().Format(time.RFC3339)
+            id := fmt.Sprintf("%x", sha1.Sum([]byte(u)))
+            addWeb(WebDoc{ID: id, Title: title, Url: u, Snippet: desc, Body: body, Headings: headings, Source: hostOf(u), Date: now, Lang: lang})
+
+            if img := firstGroup(reMetaOGImg.FindStringSubmatch(html)); img != "" {
+                ai := absURL(u, img)
+                addImg(map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(ai))), "title": title, "thumbnailUrl": ai, "imageUrl": ai, "source": hostOf(ai), "date": now})
+            }
+            if vid := firstGroup(reMetaOGVid.FindStringSubmatch(html)); vid != "" {
+                av := absURL(u, vid)
+                addVid(map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(av))), "title": title, "url": av, "duration": "", "source": hostOf(av), "date": now})
+            }
+            ogType := strings.ToLower(firstGroup(reMetaOGType.FindStringSubmatch(html)))
+            if ogType == "article" {
+                pub := firstGroup(reMetaArtPub.FindStringSubmatch(html))
+                if pub == "" { pub = now }
+                addNews(map[string]string{"id": id, "title": title, "url": u, "snippet": desc, "source": hostOf(u), "date": pub})
+            }
+            for _, m := range reImgTags.FindAllStringSubmatch(html, -1) {
+                src := absURL(u, m[1])
+                if src == "" { continue }
+                addImg(map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(src))), "title": title, "thumbnailUrl": src, "imageUrl": src, "source": hostOf(src), "date": now})
+            }
+            // Enqueue links discovered
+            if it.depth < maxDepth {
+                for _, m := range reLinks.FindAllStringSubmatch(html, -1) {
+                    href := absURL(u, m[1])
+                    if href == "" { continue }
+                    if sameDomain && !allowed[hostOf(href)] { continue }
+                    mu.Lock()
+                    if !seen[href] && processed < maxPages {
+                        seen[href] = true
+                        q = append(q, item{u: href, depth: it.depth + 1})
+                    }
+                    mu.Unlock()
                 }
             }
-        }
+            if len(pol.sitemaps) > 0 {
+                for _, sm := range pol.sitemaps {
+                    urls := fetchSitemap(client, sm)
+                    for _, su := range urls {
+                        if sameDomain && !allowed[hostOf(su)] { continue }
+                        mu.Lock()
+                        if !seen[su] && processed < maxPages {
+                            seen[su] = true
+                            q = append(q, item{u: su, depth: it.depth + 1})
+                        }
+                        mu.Unlock()
+                    }
+                }
+            }
+        }(it)
     }
     // Final flush
+    batchMu.Lock()
     if len(webBatch) > 0 { postJSON(base+"/v1/admin/index/web", map[string]any{"docs": webBatch}) }
     if len(imgBatch) > 0 { postJSON(base+"/v1/admin/index/images", map[string]any{"docs": imgBatch}) }
     if len(vidBatch) > 0 { postJSON(base+"/v1/admin/index/videos", map[string]any{"docs": vidBatch}) }
     if len(newsBatch) > 0 { postJSON(base+"/v1/admin/index/news", map[string]any{"docs": newsBatch}) }
+    batchMu.Unlock()
     // Save updated frontier
     saveFrontier(frontierPath, q, seen)
     // Post crawl stats per host
@@ -281,9 +333,21 @@ func extractMainText(html string) string {
 func firstGroup(m []string) string { if len(m) >= 2 { return m[1] }; return "" }
 func stripSpaces(s string) string { return regexp.MustCompile(`\s+`).ReplaceAllString(s, " ") }
 func hostOf(u string) string {
+    if strings.TrimSpace(u) == "" { return "" }
+    if uu, err := url.Parse(u); err == nil {
+        // Only consider http(s) URLs as valid crawl targets/hosts
+        if uu.Scheme == "http" || uu.Scheme == "https" || uu.Scheme == "" {
+            if uu.Host != "" { return uu.Host }
+        } else {
+            return ""
+        }
+    }
+    // Fallback best-effort extraction (for schemeless URLs)
     if i := strings.Index(u, "://"); i >= 0 { u = u[i+3:] }
     if j := strings.Index(u, "/"); j >= 0 { u = u[:j] }
     if k := strings.Index(u, "#"); k >= 0 { u = u[:k] }
+    // If the remaining text still looks like a non-http scheme, drop it
+    if strings.Contains(u, ":") && !strings.Contains(u, "]") && strings.Count(u, ":") > 1 { return "" }
     return u
 }
 
@@ -319,10 +383,13 @@ func dirOf(p string) string {
 func getenv(k, d string) string { if v := os.Getenv(k); v != "" { return v }; return d }
 func atoi(s string) int { n := 0; for _, r := range s { if r<'0'||r>'9' { return n }; n = n*10 + int(r-'0') }; return n }
 func absURL(baseStr, ref string) string {
-    if strings.HasPrefix(ref, "data:") { return "" }
+    if strings.HasPrefix(strings.ToLower(ref), "data:") { return "" }
     bu, err := url.Parse(baseStr); if err != nil { return "" }
     ru, err := url.Parse(ref); if err != nil { return "" }
-    return bu.ResolveReference(ru).String()
+    u := bu.ResolveReference(ru)
+    // Ignore non-http(s) schemes like mailto:, javascript:, tel:, etc.
+    if u.Scheme != "http" && u.Scheme != "https" { return "" }
+    return u.String()
 }
 type policy struct{
     inited bool
@@ -349,8 +416,10 @@ func (p policy) allowed(u string) bool {
 }
 func fetchRobots(client *http.Client, host, agent string) policy {
     p := policy{inited: true}
+    if strings.TrimSpace(host) == "" { return p }
     url := "http://"+host+"/robots.txt"
-    req, _ := http.NewRequest("GET", url, nil)
+    req, err := http.NewRequest("GET", url, nil)
+    if err != nil { return p }
     req.Header.Set("User-Agent", agent)
     resp, err := client.Do(req)
     if err != nil { return p }
@@ -423,10 +492,32 @@ func fetchSitemap(client *http.Client, u string) []string {
 }
 func postJSON(u string, v any) {
     b, _ := json.Marshal(v)
-    req, _ := http.NewRequest("POST", u, bytes.NewReader(b))
-    req.Header.Set("Content-Type", "application/json")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil { log.Printf("post %s error: %v", u, err); return }
-    defer resp.Body.Close()
-    if resp.StatusCode >= 300 { out, _ := io.ReadAll(resp.Body); log.Printf("post %s failed: %s", u, string(out)) }
+    // Retry with simple exponential backoff to tolerate brief DNS/connection issues
+    maxRetries := 5
+    backoff := time.Second
+    for attempt := 0; attempt <= maxRetries; attempt++ {
+        req, err := http.NewRequest("POST", u, bytes.NewReader(b))
+        if err != nil { log.Printf("post %s newrequest error: %v", u, err); return }
+        req.Header.Set("Content-Type", "application/json")
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+            if attempt == maxRetries {
+                log.Printf("post %s error (final): %v", u, err)
+                return
+            }
+            log.Printf("post %s error (attempt %d/%d): %v", u, attempt+1, maxRetries+1, err)
+            time.Sleep(backoff)
+            backoff *= 2
+            if backoff > 15*time.Second { backoff = 15 * time.Second }
+            continue
+        }
+        func() {
+            defer resp.Body.Close()
+            if resp.StatusCode >= 300 {
+                out, _ := io.ReadAll(resp.Body)
+                log.Printf("post %s failed: %s", u, string(out))
+            }
+        }()
+        return
+    }
 }
