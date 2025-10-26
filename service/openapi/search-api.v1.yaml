@@ -3,7 +3,7 @@ info:
   title: Berjis Search API
   version: 1.0.0
 servers:
-  - url: http://search-api.berjis.test
+  - url: http://search-api.berjis.tech
 paths:
   /v1/health:
     get:
@@ -80,7 +80,9 @@ components:
       properties:
         Title: { type: string }
         Url: { type: string }
-        Snippet: { type: string }
+        Snippet: { type: string, description: "Snippet with optional <mark> tags" }
+        SnippetHtml: { type: string, description: "HTML snippet safe for rendering (<mark> only)" }
+        SnippetPlain: { type: string, description: "Plain text snippet without markup" }
         Source: { type: string }
     Image:
       type: object
@@ -95,4 +97,5 @@ components:
         Title: { type: string }
         Url: { type: string }
         Duration: { type: string }
+        ThumbnailUrl: { type: string }
         Source: { type: string }

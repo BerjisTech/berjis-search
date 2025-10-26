@@ -569,7 +569,12 @@ func (ix *Index) Save(path string) error {
     b, err := json.MarshalIndent(snapshot{Docs: docs}, "", "  ")
     if err != nil { return err }
     if err := os.MkdirAll(dirOf(path), 0o755); err != nil { return err }
-    return os.WriteFile(path, b, 0o644)
+    // Atomic-ish write: write to temp file then rename into place
+    tmp := path + ".tmp"
+    if err := os.WriteFile(tmp, b, 0o644); err != nil { return err }
+    // On Windows, Rename does not replace existing files; remove if present
+    _ = os.Remove(path)
+    return os.Rename(tmp, path)
 }
 
 func (ix *Index) Load(path string) error {

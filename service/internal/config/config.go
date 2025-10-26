@@ -20,7 +20,7 @@ func Load() Config {
     return Config{
         Env: getenv("APP_ENV", "development"),
         Port: getenv("PORT", "8092"),
-        AllowedOrigins: getenv("ALLOWED_ORIGINS", "http://berjis.test"),
+        AllowedOrigins: getenv("ALLOWED_ORIGINS", "https://berjis.tech,https://*.berjis.tech"),
         PersistDir: getenv("PERSIST_DIR", "/data/search"),
     }
 }

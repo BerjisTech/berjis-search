@@ -11,10 +11,12 @@ import (
     "time"
 )
 
-// A lightweight scheduler that periodically runs the bundled crawler binary.
+// A lightweight scheduler that periodically runs the bundled crawler and/or video providers.
 // Env:
 //  - CRAWL_INTERVAL: duration like 30m, 1h (default 30m)
-//  - SEED_URLS: comma-separated URLs passed through to crawler via env
+//  - RUN_CRAWLER: true/false (default true)
+//  - RUN_PROVIDERS: true/false (default false; or set VIDEO_PROVIDERS=true)
+//  - SEED_URLS/VIDEO_SEEDS passed to crawler; YT_*/DM_* passed to providers.
 func main() {
     intervalStr := getenv("CRAWL_INTERVAL", "30m")
     d, err := time.ParseDuration(intervalStr)
@@ -30,30 +32,45 @@ func main() {
 }
 
 func runOnce() {
-    log.Println("search-scheduler: running crawler")
-    // Wait for search API to be reachable before spawning the crawler
+    // Wait for search API to be reachable before spawning jobs
     base := getenv("SEARCH_API_BASE", "http://search-service:8092")
     if !waitForSearch(base, 90*time.Second) {
         log.Printf("search-scheduler: search API not reachable at %s; skipping run", base)
         return
     }
-    cmd := exec.Command("/app/search-crawler")
-    // propagate MEILI_* and SEED_URLS
-    env := os.Environ()
-    cmd.Env = env
-    // Retry the crawler up to 2 additional times on failure
-    attempts := 0
-    for {
-        out, err := cmd.CombinedOutput()
-        if err != nil {
-            attempts++
-            log.Printf("search-scheduler: crawler error (attempt %d): %v, out=%s", attempts, err, string(out))
-            if attempts >= 3 { break }
-            time.Sleep(15 * time.Second)
-            continue
+
+    runCrawler := strings.ToLower(getenv("RUN_CRAWLER", "true")) == "true"
+    runProviders := strings.ToLower(getenv("RUN_PROVIDERS", getenv("VIDEO_PROVIDERS", "false"))) == "true"
+
+    if runCrawler {
+        log.Println("search-scheduler: running crawler")
+        cmd := exec.Command("/app/search-crawler")
+        cmd.Env = os.Environ()
+        attempts := 0
+        for {
+            out, err := cmd.CombinedOutput()
+            if err != nil {
+                attempts++
+                log.Printf("search-scheduler: crawler error (attempt %d): %v, out=%s", attempts, err, string(out))
+                if attempts >= 3 { break }
+                time.Sleep(15 * time.Second)
+                continue
+            }
+            log.Printf("search-scheduler: crawler done, bytes=%s", strconv.Itoa(len(out)))
+            break
         }
-        log.Printf("search-scheduler: crawler done, bytes=%s", strconv.Itoa(len(out)))
-        break
+    }
+
+    if runProviders {
+        log.Println("search-scheduler: running video providers fetcher")
+        vcmd := exec.Command("/app/search-video-providers")
+        vcmd.Env = os.Environ()
+        vout, verr := vcmd.CombinedOutput()
+        if verr != nil {
+            log.Printf("search-scheduler: video providers error: %v out=%s", verr, string(vout))
+        } else {
+            log.Printf("search-scheduler: video providers done, bytes=%s", strconv.Itoa(len(vout)))
+        }
     }
 }
 

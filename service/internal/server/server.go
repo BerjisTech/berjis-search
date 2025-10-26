@@ -10,6 +10,9 @@ import (
     spec "github.com/berjistech/berjis-ecosystem/search/service/openapi"
     "github.com/berjistech/berjis-ecosystem/search/service/internal/searchindex"
     "github.com/berjistech/berjis-ecosystem/search/service/internal/config"
+    htmlpkg "html"
+    "sync"
+    "time"
 )
 
 type Options struct {
@@ -20,6 +23,20 @@ func New(opts Options) *fiber.App {
     app := fiber.New()
     cfg := config.Load()
     store := searchindex.NewStore()
+    // serialize write operations per vertical to avoid concurrent map writes and debounced snapshots
+    var muWeb, muImg, muVid, muNews sync.Mutex
+    var dirtyWeb, dirtyImg, dirtyVid, dirtyNews bool
+    saveEvery := func() time.Duration { if s := os.Getenv("SAVE_INTERVAL_SEC"); s != "" { if d, err := strconv.Atoi(s); err == nil && d > 0 { return time.Duration(d) * time.Second } }; return 30 * time.Second }()
+    go func() {
+        t := time.NewTicker(saveEvery)
+        defer t.Stop()
+        for range t.C {
+            muWeb.Lock(); if dirtyWeb { _ = store.Web.Save(filepath.Join(cfg.PersistDir, "web.json")); dirtyWeb = false }; muWeb.Unlock()
+            muImg.Lock(); if dirtyImg { _ = store.Images.Save(filepath.Join(cfg.PersistDir, "images.json")); dirtyImg = false }; muImg.Unlock()
+            muVid.Lock(); if dirtyVid { _ = store.Videos.Save(filepath.Join(cfg.PersistDir, "videos.json")); dirtyVid = false }; muVid.Unlock()
+            muNews.Lock(); if dirtyNews { _ = store.News.Save(filepath.Join(cfg.PersistDir, "news.json")); dirtyNews = false }; muNews.Unlock()
+        }
+    }()
     // Load persisted indexes if available
     _ = store.Web.Load(filepath.Join(cfg.PersistDir, "web.json"))
     _ = store.Images.Load(filepath.Join(cfg.PersistDir, "images.json"))
@@ -53,16 +70,19 @@ func New(opts Options) *fiber.App {
     if b, err := os.ReadFile(weightsPath); err == nil { _ = json.Unmarshal(b, &weights) }
     if len(weights) > 0 { searchindex.SetWeights(weights) }
 
-    // CORS allowlist (reflect origin) for berjis.test and subdomains
+    // CORS allowlist (reflect origin) for berjis.tech and subdomains
     app.Use(func(c *fiber.Ctx) error {
         origin := c.Get("Origin")
         if origin != "" {
-            if origin == "http://berjis.test" || strings.HasSuffix(origin, ".berjis.test") {
+            if origin == "https://berjis.tech" || strings.HasSuffix(origin, ".berjis.tech") {
                 c.Set("Access-Control-Allow-Origin", origin)
                 c.Set("Vary", "Origin")
                 c.Set("Access-Control-Allow-Credentials", "true")
                 c.Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-                c.Set("Access-Control-Allow-Headers", "Authorization,Content-Type,Accept")
+                // reflect requested headers if present to avoid preflight rejections
+                reqHdrs := strings.TrimSpace(c.Get("Access-Control-Request-Headers"))
+                if reqHdrs == "" { reqHdrs = "Authorization,Content-Type,Accept" }
+                c.Set("Access-Control-Allow-Headers", reqHdrs)
                 if c.Method() == fiber.MethodOptions { return c.SendStatus(fiber.StatusNoContent) }
             }
         }
@@ -103,14 +123,14 @@ func New(opts Options) *fiber.App {
     // Seed demo documents into in-memory index
     app.Post("/v1/admin/index/seed", func(c *fiber.Ctx) error {
         demo := []searchindex.Doc{
-            { ID: "1", Title: "Berjis – Unified Ecosystem", Url: "http://berjis.test", Snippet: "Suite of interconnected apps with single sign-on.", Source: "berjis.test" },
-            { ID: "2", Title: "Logistics", Url: "http://logistics.berjis.test", Snippet: "Logistics platform for supply chain actors.", Source: "logistics.berjis.test" },
-            { ID: "3", Title: "Docs", Url: "http://docs.berjis.test", Snippet: "Create and collaborate on documents.", Source: "docs.berjis.test" },
-            { ID: "4", Title: "Sheets", Url: "http://sheets.berjis.test", Snippet: "Powerful spreadsheets for teams.", Source: "sheets.berjis.test" },
-            { ID: "5", Title: "Slides", Url: "http://slides.berjis.test", Snippet: "Beautiful presentations.", Source: "slides.berjis.test" },
-            { ID: "6", Title: "Notes", Url: "http://notes.berjis.test", Snippet: "Quick notes synced across devices.", Source: "notes.berjis.test" },
-            { ID: "7", Title: "Communities", Url: "http://communities.berjis.test", Snippet: "Join discussions and groups.", Source: "communities.berjis.test" },
-            { ID: "8", Title: "Architect", Url: "http://architect.berjis.test", Snippet: "Design and architecture suite.", Source: "architect.berjis.test" },
+            { ID: "1", Title: "Berjis – Unified Ecosystem", Url: "https://berjis.tech", Snippet: "Suite of interconnected apps with single sign-on.", Source: "berjis.tech" },
+            { ID: "2", Title: "Logistics", Url: "https://logistics.berjis.tech", Snippet: "Logistics platform for supply chain actors.", Source: "logistics.berjis.tech" },
+            { ID: "3", Title: "Docs", Url: "https://docs.berjis.tech", Snippet: "Create and collaborate on documents.", Source: "docs.berjis.tech" },
+            { ID: "4", Title: "Sheets", Url: "https://sheets.berjis.tech", Snippet: "Powerful spreadsheets for teams.", Source: "sheets.berjis.tech" },
+            { ID: "5", Title: "Slides", Url: "https://slides.berjis.tech", Snippet: "Beautiful presentations.", Source: "slides.berjis.tech" },
+            { ID: "6", Title: "Notes", Url: "https://notes.berjis.tech", Snippet: "Quick notes synced across devices.", Source: "notes.berjis.tech" },
+            { ID: "7", Title: "Communities", Url: "https://communities.berjis.tech", Snippet: "Join discussions and groups.", Source: "communities.berjis.tech" },
+            { ID: "8", Title: "Architect", Url: "https://architect.berjis.tech", Snippet: "Design and architecture suite.", Source: "architect.berjis.tech" },
         }
         for _, d := range demo { store.Web.Add(d) }
         _ = store.Web.Save(filepath.Join(cfg.PersistDir, "web.json"))
@@ -359,39 +379,46 @@ func New(opts Options) *fiber.App {
     type BulkWebDoc struct { ID, Title, Url, Snippet, Body, Headings, Source, Date, Lang string }
     type BulkWeb struct { Docs []BulkWebDoc `json:"docs"` }
     app.Post("/v1/admin/index/web", func(c *fiber.Ctx) error {
+        muWeb.Lock(); defer muWeb.Unlock()
         var body BulkWeb
         if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
         for _, d := range body.Docs {
             store.Web.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Snippet, Body: d.Body, Headings: d.Headings, Source: d.Source, Date: d.Date, Lang: d.Lang})
         }
-        _ = store.Web.Save(filepath.Join(cfg.PersistDir, "web.json"))
+        dirtyWeb = true
         return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
     })
     type ImageDoc struct { ID, Title, ThumbnailUrl, ImageUrl, Source, Date string }
     type BulkImages struct { Docs []ImageDoc `json:"docs"` }
     app.Post("/v1/admin/index/images", func(c *fiber.Ctx) error {
+        muImg.Lock(); defer muImg.Unlock()
         var body BulkImages
         if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
         for _, d := range body.Docs { store.Images.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.ImageUrl, Snippet: d.ThumbnailUrl, Source: d.Source, Date: d.Date}) }
-        _ = store.Images.Save(filepath.Join(cfg.PersistDir, "images.json"))
+        dirtyImg = true
         return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
     })
-    type VideoDoc struct { ID, Title, Url, Duration, Source, Date string }
+    type VideoDoc struct { ID, Title, Url, Duration, ThumbnailUrl, Source, Date string }
     type BulkVideos struct { Docs []VideoDoc `json:"docs"` }
     app.Post("/v1/admin/index/videos", func(c *fiber.Ctx) error {
+        muVid.Lock(); defer muVid.Unlock()
         var body BulkVideos
         if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
-        for _, d := range body.Docs { store.Videos.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Duration, Source: d.Source, Date: d.Date}) }
-        _ = store.Videos.Save(filepath.Join(cfg.PersistDir, "videos.json"))
+        for _, d := range body.Docs {
+            // Store duration in Snippet; store thumbnail URL in Body for later retrieval
+            store.Videos.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Duration, Body: d.ThumbnailUrl, Source: d.Source, Date: d.Date})
+        }
+        dirtyVid = true
         return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
     })
     type NewsDoc struct { ID, Title, Url, Snippet, Source, Date string }
     type BulkNews struct { Docs []NewsDoc `json:"docs"` }
     app.Post("/v1/admin/index/news", func(c *fiber.Ctx) error {
+        muNews.Lock(); defer muNews.Unlock()
         var body BulkNews
         if err := c.BodyParser(&body); err != nil { return c.Status(400).JSON(fiber.Map{"success": false, "message": "invalid body"}) }
         for _, d := range body.Docs { store.News.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Snippet, Source: d.Source, Date: d.Date}) }
-        _ = store.News.Save(filepath.Join(cfg.PersistDir, "news.json"))
+        dirtyNews = true
         return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
     })
 
@@ -414,20 +441,32 @@ func New(opts Options) *fiber.App {
         if typ == "all" {
             lang := c.Query("lang", "")
             found, total, facets := store.Web.FilteredSearch(q, sourceF, lang, from, to, sort, page, 10)
-            type Web struct{ Title, Url, Snippet, Source string }
+            type Web struct{ Title, Url, Snippet, SnippetHtml, SnippetPlain, Source string }
             out := make([]Web, 0, len(found))
             langFacets := map[string]int64{}
             for _, r := range found {
-                out = append(out, Web{Title: r.Doc.Title, Url: r.Doc.Url, Snippet: highlight(r.Doc.Snippet, q), Source: r.Doc.Source})
+                sh := highlight(r.Doc.Snippet, q)
+                sp := htmlpkg.UnescapeString(strings.ReplaceAll(strings.ReplaceAll(sh, "<mark>", ""), "</mark>", ""))
+                out = append(out, Web{Title: htmlpkg.UnescapeString(r.Doc.Title), Url: r.Doc.Url, Snippet: sh, SnippetHtml: sh, SnippetPlain: sp, Source: r.Doc.Source})
                 l := strings.TrimSpace(strings.ToLower(r.Doc.Lang))
                 if l == "" { l = "unknown" }
                 langFacets[l] = langFacets[l] + 1
+            }
+            if total == 0 {
+                nfound, ntotal, nfacets := store.News.FilteredSearch(q, sourceF, "", from, to, sort, page, 10)
+                out = out[:0]
+                for _, r := range nfound {
+                    sh := highlight(r.Doc.Snippet, q)
+                    sp := htmlpkg.UnescapeString(strings.ReplaceAll(strings.ReplaceAll(sh, "<mark>", ""), "</mark>", ""))
+                    out = append(out, Web{ Title: htmlpkg.UnescapeString(r.Doc.Title), Url: r.Doc.Url, Snippet: sp, SnippetHtml: sh, SnippetPlain: sp, Source: r.Doc.Source })
+                }
+                return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": ntotal, "results": out, "facets": fiber.Map{"source": nfacets, "lang": langFacets}}})
             }
             return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": total, "results": out, "facets": fiber.Map{"source": facets, "lang": langFacets}}})
         }
 
         // Placeholder results; swap with real index/metasearch later
-        type Web struct{ Title, Url, Snippet, Source string }
+        type Web struct{ Title, Url, Snippet, SnippetHtml, SnippetPlain, Source string }
         type Image struct{ Title, ThumbnailUrl, ImageUrl, Source string }
         type Video struct{ Title, Url, Duration, Source string }
         var results any
@@ -441,44 +480,52 @@ func New(opts Options) *fiber.App {
             return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": out, "facets": fiber.Map{"source": facets}}})
         case "videos":
             found, totalCount, facets := store.Videos.FilteredSearch(q, sourceF, "", from, to, sort, page, 10)
-            outV := make([]Video, 0, len(found))
-            for _, r := range found { outV = append(outV, Video{ Title: r.Doc.Title, Url: r.Doc.Url, Duration: r.Doc.Snippet, Source: r.Doc.Source }) }
+            type VideoOut struct{ Title, Url, Duration, ThumbnailUrl, Source string }
+            outV := make([]VideoOut, 0, len(found))
+            for _, r := range found {
+                outV = append(outV, VideoOut{ Title: htmlpkg.UnescapeString(r.Doc.Title), Url: r.Doc.Url, Duration: r.Doc.Snippet, ThumbnailUrl: r.Doc.Body, Source: r.Doc.Source })
+            }
             return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": outV, "facets": fiber.Map{"source": facets}}})
         case "news":
             found, totalCount, facets := store.News.FilteredSearch(q, sourceF, "", from, to, sort, page, 10)
             outN := make([]Web, 0, len(found))
-            for _, r := range found { outN = append(outN, Web{ Title: r.Doc.Title, Url: r.Doc.Url, Snippet: highlight(r.Doc.Snippet, q), Source: r.Doc.Source }) }
+            for _, r := range found {
+                sh := highlight(r.Doc.Snippet, q)
+                sp := htmlpkg.UnescapeString(strings.ReplaceAll(strings.ReplaceAll(sh, "<mark>", ""), "</mark>", ""))
+                // For news, default Snippet to plain text to avoid entities when clients render as text
+                outN = append(outN, Web{ Title: htmlpkg.UnescapeString(r.Doc.Title), Url: r.Doc.Url, Snippet: sp, SnippetHtml: sh, SnippetPlain: sp, Source: r.Doc.Source })
+            }
             return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sort, "page": page, "total": totalCount, "results": outN, "facets": fiber.Map{"source": facets}}})
         case "forums":
             results = []Web{
-                { Title: "Communities: Discuss Berjis", Url: "http://communities.berjis.test", Snippet: "Join conversations about the Berjis ecosystem.", Source: "communities.berjis.test" },
+                { Title: "Communities: Discuss Berjis", Url: "http://communities.berjis.tech", Snippet: "Join conversations about the Berjis ecosystem.", Source: "communities.berjis.tech" },
             }
             total = 1
         case "books":
             results = []Web{
-                { Title: "Berjis Books", Url: "http://books.berjis.test", Snippet: "Explore and organize your digital library.", Source: "books.berjis.test" },
+                { Title: "Berjis Books", Url: "http://books.berjis.tech", Snippet: "Explore and organize your digital library.", Source: "books.berjis.tech" },
             }
             total = 1
         case "map":
             results = []Web{
-                { Title: "Logistics Map", Url: "http://logistics.berjis.test", Snippet: "Track deliveries and warehouses.", Source: "logistics.berjis.test" },
+                { Title: "Logistics Map", Url: "https://logistics.berjis.tech", Snippet: "Track deliveries and warehouses.", Source: "logistics.berjis.tech" },
             }
             total = 1
         case "finance":
             results = []Web{
-                { Title: "Billing Portal", Url: "http://berjis.test/account", Snippet: "Manage subscriptions and payments.", Source: "api.berjis.test" },
+                { Title: "Billing Portal", Url: "https://berjis.tech/account", Snippet: "Manage subscriptions and payments.", Source: "api.berjis.tech" },
             }
             total = 1
         default:
             results = []Web{
-                { Title: "Berjis – Unified Ecosystem", Url: "http://berjis.test", Snippet: "Suite of interconnected apps with single sign-on.", Source: "berjis.test" },
-                { Title: "Logistics", Url: "http://logistics.berjis.test", Snippet: "Logistics platform for supply chain actors.", Source: "logistics.berjis.test" },
-                { Title: "Docs", Url: "http://docs.berjis.test", Snippet: "Create and collaborate on documents.", Source: "docs.berjis.test" },
-                { Title: "Sheets", Url: "http://sheets.berjis.test", Snippet: "Powerful spreadsheets for teams.", Source: "sheets.berjis.test" },
-                { Title: "Slides", Url: "http://slides.berjis.test", Snippet: "Beautiful presentations in your browser.", Source: "slides.berjis.test" },
-                { Title: "Notes", Url: "http://notes.berjis.test", Snippet: "Quick notes synced across devices.", Source: "notes.berjis.test" },
-                { Title: "Communities", Url: "http://communities.berjis.test", Snippet: "Join discussions and groups.", Source: "communities.berjis.test" },
-                { Title: "Architect", Url: "http://architect.berjis.test", Snippet: "Design and architecture suite.", Source: "architect.berjis.test" },
+                { Title: "Berjis – Unified Ecosystem", Url: "https://berjis.tech", Snippet: "Suite of interconnected apps with single sign-on.", Source: "berjis.tech" },
+                { Title: "Logistics", Url: "https://logistics.berjis.tech", Snippet: "Logistics platform for supply chain actors.", Source: "logistics.berjis.tech" },
+                { Title: "Docs", Url: "https://docs.berjis.tech", Snippet: "Create and collaborate on documents.", Source: "docs.berjis.tech" },
+                { Title: "Sheets", Url: "https://sheets.berjis.tech", Snippet: "Powerful spreadsheets for teams.", Source: "sheets.berjis.tech" },
+                { Title: "Slides", Url: "https://slides.berjis.tech", Snippet: "Beautiful presentations in your browser.", Source: "slides.berjis.tech" },
+                { Title: "Notes", Url: "https://notes.berjis.tech", Snippet: "Quick notes synced across devices.", Source: "notes.berjis.tech" },
+                { Title: "Communities", Url: "https://communities.berjis.tech", Snippet: "Join discussions and groups.", Source: "communities.berjis.tech" },
+                { Title: "Architect", Url: "https://architect.berjis.tech", Snippet: "Design and architecture suite.", Source: "architect.berjis.tech" },
             }
             total = 8
         }
@@ -524,6 +571,8 @@ func highlight(snippet string, q string) string {
     const mkEnd = "\u0000MK_E\u0000"
     for _, ph := range phrases { if ph != "" { s = strings.ReplaceAll(s, ph, mkStart+ph+mkEnd) } }
     for _, tok := range toks { if tok != "" { s = strings.ReplaceAll(s, tok, mkStart+tok+mkEnd) } }
+    // Decode any existing HTML entities in snippet before escaping to avoid double-encoding
+    s = htmlpkg.UnescapeString(s)
     s = escapeHTML(s)
     s = strings.ReplaceAll(s, escapeHTML(mkStart), "<mark>")
     s = strings.ReplaceAll(s, escapeHTML(mkEnd), "</mark>")

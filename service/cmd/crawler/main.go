@@ -31,6 +31,10 @@ var (
     reMetaArtPub = regexp.MustCompile(`(?is)<meta\s+property=["']article:published_time["']\s+content=["']([^"']+)["'][^>]*>`) 
     reLinks    = regexp.MustCompile(`(?is)<a\s+[^>]*href=["']([^"']+)["'][^>]*>`) 
     reImgTags  = regexp.MustCompile(`(?is)<img\s+[^>]*src=["']([^"']+)["'][^>]*>`) 
+    reVideoTag = regexp.MustCompile(`(?is)<video\s+[^>]*src=["']([^"']+)["'][^>]*>`) 
+    reSourceTag = regexp.MustCompile(`(?is)<source\s+[^>]*src=["']([^"']+)["'][^>]*>`) 
+    reIframe   = regexp.MustCompile(`(?is)<iframe\s+[^>]*src=["']([^"']+)["'][^>]*>`) 
+    reJSONLDScripts = regexp.MustCompile(`(?is)<script[^>]+type=["']application/ld\+json["'][^>]*>([\s\S]*?)</script>`) 
     reArticle  = regexp.MustCompile(`(?is)<article[^>]*>([\s\S]*?)</article>`) 
     reMain     = regexp.MustCompile(`(?is)<main[^>]*>([\s\S]*?)</main>`) 
     reBody     = regexp.MustCompile(`(?is)<body[^>]*>([\s\S]*?)</body>`) 
@@ -52,16 +56,20 @@ func main() {
     _ = config.Load() // reserved for future use
     base := getenv("SEARCH_API_BASE", "http://search-service:8092")
     seeds := strings.Split(os.Getenv("SEED_URLS"), ",")
+    // Optional: additional external video seeds (e.g., YouTube/Dailymotion URLs)
+    if vs := strings.TrimSpace(os.Getenv("VIDEO_SEEDS")); vs != "" {
+        for _, v := range strings.Split(vs, ",") { vv := strings.TrimSpace(v); if vv != "" { seeds = append(seeds, vv) } }
+    }
     if len(seeds) == 0 || (len(seeds) == 1 && strings.TrimSpace(seeds[0]) == "") {
         seeds = []string{
-            "http://berjis.test",
-            "http://logistics.berjis.test",
-            "http://docs.berjis.test",
-            "http://sheets.berjis.test",
-            "http://slides.berjis.test",
-            "http://notes.berjis.test",
-            "http://communities.berjis.test",
-            "http://architect.berjis.test",
+            "http://berjis.tech",
+            "http://logistics.berjis.tech",
+            "http://docs.berjis.tech",
+            "http://sheets.berjis.tech",
+            "http://slides.berjis.tech",
+            "http://notes.berjis.tech",
+            "http://communities.berjis.tech",
+            "http://architect.berjis.tech",
         }
     }
     // Frontier crawl (persistent frontier)
@@ -180,7 +188,36 @@ func main() {
             }
             if vid := firstGroup(reMetaOGVid.FindStringSubmatch(html)); vid != "" {
                 av := absURL(u, vid)
-                addVid(map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(av))), "title": title, "url": av, "duration": "", "source": hostOf(av), "date": now})
+                // attempt to pair a thumbnail using og:image if present
+                thumb := firstGroup(reMetaOGImg.FindStringSubmatch(html))
+                at := ""
+                if thumb != "" { at = absURL(u, thumb) }
+                addVid(map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(av))), "title": title, "url": av, "duration": "", "thumbnailUrl": at, "source": hostOf(av), "date": now})
+            }
+            // Capture embedded iframes (YouTube/Vimeo/Dailymotion)
+            for _, m := range reIframe.FindAllStringSubmatch(html, -1) {
+                isrc := absURL(u, m[1])
+                if isrc == "" { continue }
+                wurl, thumb := normalizeEmbed(isrc)
+                if wurl == "" { continue }
+                addVid(map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(wurl))), "title": title, "url": wurl, "duration": "", "thumbnailUrl": thumb, "source": hostOf(wurl), "date": now})
+            }
+            // Also capture <video src> and <source src> entries
+            for _, m := range reVideoTag.FindAllStringSubmatch(html, -1) {
+                src := absURL(u, m[1])
+                if src == "" { continue }
+                addVid(map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(src))), "title": title, "url": src, "duration": "", "thumbnailUrl": "", "source": hostOf(src), "date": now})
+            }
+            for _, m := range reSourceTag.FindAllStringSubmatch(html, -1) {
+                src := absURL(u, m[1])
+                if src == "" { continue }
+                addVid(map[string]string{"id": fmt.Sprintf("%x", sha1.Sum([]byte(src))), "title": title, "url": src, "duration": "", "thumbnailUrl": "", "source": hostOf(src), "date": now})
+            }
+            // JSON-LD VideoObject
+            for _, sm := range reJSONLDScripts.FindAllStringSubmatch(html, -1) {
+                for _, v := range extractJSONLDVideos(sm[1]) {
+                    addVid(v)
+                }
             }
             ogType := strings.ToLower(firstGroup(reMetaOGType.FindStringSubmatch(html)))
             if ogType == "article" {
@@ -520,4 +557,109 @@ func postJSON(u string, v any) {
         }()
         return
     }
+}
+// normalizeEmbed maps common embed URLs to canonical watch URLs and thumbnails.
+func normalizeEmbed(u string) (watchURL string, thumb string) {
+    // YouTube embeds
+    // e.g., https://www.youtube.com/embed/VIDEOID or //www.youtube.com/embed/VIDEOID
+    if strings.Contains(u, "/embed/") && strings.Contains(u, "youtube.com") {
+        parts := strings.Split(u, "/embed/")
+        if len(parts) >= 2 {
+            id := parts[1]
+            // strip params
+            if i := strings.IndexAny(id, "?#&/"); i != -1 { id = id[:i] }
+            if id != "" {
+                return "https://www.youtube.com/watch?v=" + id, "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg"
+            }
+        }
+    }
+    // youtu.be short links
+    if strings.Contains(u, "youtu.be/") {
+        id := u[strings.Index(u, "youtu.be/")+9:]
+        if i := strings.IndexAny(id, "?#&/"); i != -1 { id = id[:i] }
+        if id != "" { return "https://www.youtube.com/watch?v=" + id, "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg" }
+    }
+    // Dailymotion embed: https://www.dailymotion.com/embed/video/{id}
+    if strings.Contains(u, "dailymotion.com/embed/video/") {
+        id := u[strings.Index(u, "/embed/video/")+len("/embed/video/"):]
+        if i := strings.IndexAny(id, "?#&/"); i != -1 { id = id[:i] }
+        if id != "" { return "https://www.dailymotion.com/video/" + id, "" }
+    }
+    // Vimeo embed: https://player.vimeo.com/video/{id}
+    if strings.Contains(u, "player.vimeo.com/video/") {
+        id := u[strings.Index(u, "/video/")+len("/video/"):]
+        if i := strings.IndexAny(id, "?#&/"); i != -1 { id = id[:i] }
+        if id != "" { return "https://vimeo.com/" + id, "" }
+    }
+    return "", ""
+}
+
+type jsonLDVideo struct {
+    Type         any     `json:"@type"`
+    Name         string  `json:"name"`
+    ThumbnailUrl any     `json:"thumbnailUrl"`
+    ContentUrl   string  `json:"contentUrl"`
+    EmbedUrl     string  `json:"embedUrl"`
+    UploadDate   string  `json:"uploadDate"`
+    DatePublished string `json:"datePublished"`
+}
+
+func extractJSONLDVideos(raw string) []map[string]string {
+    // raw may contain multiple JSON objects; try to decode as array or single
+    var out []map[string]string
+    // Try array first
+    var arr []jsonLDVideo
+    if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &arr); err == nil {
+        for _, v := range arr { addJSONLD(&out, v) }
+        return out
+    }
+    var single jsonLDVideo
+    if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &single); err == nil {
+        addJSONLD(&out, single)
+    }
+    return out
+}
+
+func addJSONLD(out *[]map[string]string, v jsonLDVideo) {
+    if !isTypeVideo(v.Type) { return }
+    title := strings.TrimSpace(v.Name)
+    // Prefer contentUrl; else embedUrl; else nothing
+    u := strings.TrimSpace(v.ContentUrl)
+    if u == "" { u = strings.TrimSpace(v.EmbedUrl) }
+    if u == "" { return }
+    if watch, thumb := normalizeEmbed(u); watch != "" {
+        u = watch
+        if thumb != "" { v.ThumbnailUrl = thumb }
+    }
+    // Flatten thumbnailUrl (string or array)
+    thumb := ""
+    switch t := v.ThumbnailUrl.(type) {
+    case string:
+        thumb = strings.TrimSpace(t)
+    case []any:
+        for _, it := range t {
+            if s, ok := it.(string); ok && s != "" { thumb = s; break }
+        }
+    }
+    date := strings.TrimSpace(v.UploadDate)
+    if date == "" { date = strings.TrimSpace(v.DatePublished) }
+    if date == "" { date = time.Now().UTC().Format(time.RFC3339) }
+    *out = append(*out, map[string]string{
+        "id": fmt.Sprintf("%x", sha1.Sum([]byte(u))),
+        "title": title,
+        "url": u,
+        "duration": "",
+        "thumbnailUrl": thumb,
+        "source": hostOf(u),
+        "date": date,
+    })
+}
+
+func isTypeVideo(t any) bool {
+    if t == nil { return false }
+    if s, ok := t.(string); ok { return strings.EqualFold(strings.TrimSpace(s), "VideoObject") }
+    if arr, ok := t.([]any); ok {
+        for _, it := range arr { if s, ok := it.(string); ok && strings.EqualFold(strings.TrimSpace(s), "VideoObject") { return true } }
+    }
+    return false
 }
