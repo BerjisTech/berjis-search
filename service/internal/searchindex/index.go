@@ -405,6 +405,55 @@ func (ix *Index) Search(q string, limit int) []Result {
             }
         }
     }
+
+    // Intent boosts: detect common travel intents and add co-occurrence boosts
+    // Patterns handled:
+    //  - flights to <city>
+    //  - flights from <city> to <city>
+    //  - hotels/accommodation/lodging/stay in/near <place>
+    // City/place detection is naive: the token(s) after prepositions are treated as targets.
+    {
+        qn := strings.ToLower(strings.TrimSpace(q))
+        // Flights to <city>
+        if strings.Contains(qn, "flights to ") || strings.Contains(qn, "flight to ") || strings.Contains(qn, "airfare to ") || strings.Contains(qn, "tickets to ") {
+            city := afterPhraseToken(qn, "to")
+            if city != "" {
+                for id := range cand {
+                    d := ix.docs[id]
+                    corpus := strings.ToLower(d.Title + " " + d.Snippet + " " + d.Body + " " + d.Url + " " + d.Headings)
+                    if (strings.Contains(corpus, "flight") || strings.Contains(corpus, "airline") || strings.Contains(corpus, "airfare") || strings.Contains(corpus, "ticket")) && strings.Contains(corpus, city) {
+                        scores[id] += 1.2
+                    }
+                }
+            }
+        }
+        // Flights from <cityA> to <cityB>
+        if strings.Contains(qn, "flights from ") && strings.Contains(qn, " to ") {
+            a, b := routeFromTo(qn)
+            if a != "" && b != "" {
+                for id := range cand {
+                    d := ix.docs[id]
+                    corpus := strings.ToLower(d.Title + " " + d.Snippet + " " + d.Body + " " + d.Url + " " + d.Headings)
+                    if strings.Contains(corpus, "flight") && strings.Contains(corpus, a) && strings.Contains(corpus, b) {
+                        scores[id] += 1.3
+                    }
+                }
+            }
+        }
+        // Hotels/accommodation/stay/lodging in/near <place>
+        if strings.Contains(qn, "hotels in ") || strings.Contains(qn, "hotel in ") || strings.Contains(qn, "accommodation in ") || strings.Contains(qn, "lodging in ") || strings.Contains(qn, "stay in ") || strings.Contains(qn, "hotels near ") || strings.Contains(qn, "hotel near ") {
+            city := afterAny(qn, []string{"in", "near"})
+            if city != "" {
+                for id := range cand {
+                    d := ix.docs[id]
+                    corpus := strings.ToLower(d.Title + " " + d.Snippet + " " + d.Body + " " + d.Url + " " + d.Headings)
+                    if (strings.Contains(corpus, "hotel") || strings.Contains(corpus, "accommodation") || strings.Contains(corpus, "lodging") || strings.Contains(corpus, "stay")) && strings.Contains(corpus, city) {
+                        scores[id] += 1.0
+                    }
+                }
+            }
+        }
+    }
     out := make([]Result, 0, len(scores))
     for id, sc := range scores {
         n := math.Sqrt(norms[id])
@@ -414,9 +463,67 @@ func (ix *Index) Search(q string, limit int) []Result {
         sc = sc * domainBoostFor(d.Source)
         out = append(out, Result{Doc: d, Score: sc})
     }
-    sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+    // Deterministic ordering: stable sort by score, tie-break by ID then URL
+    sort.SliceStable(out, func(i, j int) bool {
+        if out[i].Score == out[j].Score {
+            if out[i].Doc.ID == out[j].Doc.ID {
+                return out[i].Doc.Url < out[j].Doc.Url
+            }
+            return out[i].Doc.ID < out[j].Doc.ID
+        }
+        return out[i].Score > out[j].Score
+    })
     if len(out) > limit { out = out[:limit] }
     return out
+}
+
+// afterPhraseToken extracts the first token after a given preposition-like token (e.g., "to", "in")
+// from a simple natural-language query string. Returns lowercase token or empty.
+func afterPhraseToken(q string, key string) string {
+    parts := strings.Fields(q)
+    for i := 0; i < len(parts)-1; i++ {
+        if parts[i] == key {
+            // Return next token stripped of punctuation
+            nxt := parts[i+1]
+            nxt = strings.Trim(nxt, ",.;:!?'\"")
+            return nxt
+        }
+    }
+    return ""
+}
+
+// afterAny returns the first token following the first matching key in keys.
+func afterAny(q string, keys []string) string {
+    parts := strings.Fields(q)
+    for i := 0; i < len(parts)-1; i++ {
+        for _, k := range keys {
+            if parts[i] == k {
+                nxt := parts[i+1]
+                nxt = strings.Trim(nxt, ",.;:!?'\"")
+                return nxt
+            }
+        }
+    }
+    return ""
+}
+
+// routeFromTo extracts tokens after "from" and after the next "to".
+func routeFromTo(q string) (from string, to string) {
+    parts := strings.Fields(q)
+    for i := 0; i < len(parts)-1; i++ {
+        if parts[i] == "from" && i+1 < len(parts) {
+            from = strings.Trim(parts[i+1], ",.;:!?'\"")
+            // find next "to"
+            for j := i + 2; j < len(parts)-0; j++ {
+                if parts[j] == "to" && j+1 < len(parts) {
+                    to = strings.Trim(parts[j+1], ",.;:!?'\"")
+                    return
+                }
+            }
+            return
+        }
+    }
+    return
 }
 
 // SetWeights updates field weights; keys: title, headings, url, snippet, body.
@@ -516,7 +623,8 @@ func removePhrases(q string) string {
 func parseBoolean(q string) (required, optional, negated map[string]struct{}) {
     required, optional, negated = map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
     toks := strings.Fields(q)
-    lastOp := "OR"
+    // Default to implicit AND to reduce spurious matches for multi-term queries
+    lastOp := "AND"
     for _, t := range toks {
         tt := strings.ToLower(t)
         switch tt {

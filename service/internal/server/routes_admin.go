@@ -1,12 +1,14 @@
 package server
 
 import (
-	"strconv"
-	"strings"
+    "os"
+    "path/filepath"
+    "strconv"
+    "strings"
 
-	"github.com/gofiber/fiber/v2"
+    "github.com/gofiber/fiber/v2"
 
-	"github.com/berjistech/berjis-ecosystem/search/service/internal/searchindex"
+    "github.com/berjistech/berjis-ecosystem/search/service/internal/searchindex"
 )
 
 func registerAdminRoutes(app *fiber.App, state *serverState) {
@@ -233,7 +235,7 @@ func registerAdminRoutes(app *fiber.App, state *serverState) {
 		return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"imported": len(docs)}})
 	})
 
-	app.Post("/v1/admin/index/:vertical/reindex", func(c *fiber.Ctx) error {
+    app.Post("/v1/admin/index/:vertical/reindex", func(c *fiber.Ctx) error {
 		v := c.Params("vertical")
 		ix, mu, dirty, snap, ok := state.resourcesFor(v)
 		if !ok {
@@ -260,8 +262,90 @@ func registerAdminRoutes(app *fiber.App, state *serverState) {
 		if dirty != nil {
 			*dirty = false
 		}
-		return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"total": ix.Total(), "from": map[bool]string{true: "memory", false: "disk"}[from == "memory"]}})
-	})
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"total": ix.Total(), "from": map[bool]string{true: "memory", false: "disk"}[from == "memory"]}})
+    })
+
+    // Clear the crawler frontier file (queue + seen set) to force a fresh crawl from current SEED_URLS.
+    // Path resolution: prefers FRONTIER_PATH env; else defaults to persistDir/frontier.json
+    app.Post("/v1/admin/crawler/frontier/clear", func(c *fiber.Ctx) error {
+        frontier := strings.TrimSpace(os.Getenv("FRONTIER_PATH"))
+        if frontier == "" {
+            frontier = filepath.Join(state.persistDir, "frontier.json")
+        }
+        removed := false
+        if _, err := os.Stat(frontier); err == nil {
+            if err := os.Remove(frontier); err == nil {
+                removed = true
+            }
+        }
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"removed": removed, "path": frontier}})
+    })
+
+    // Seed helpful defaults for African web search: synonyms and domain priors.
+    // Overwrites in-memory values and persists to disk.
+    app.Post("/v1/admin/search/africa-defaults", func(c *fiber.Ctx) error {
+        // Synonyms (all lowercase)
+        syn := Synonyms{
+            "flight":       {"flights", "airfare", "airline", "ticket", "tickets", "plane", "air travel"},
+            "hotel":        {"hotels", "lodging", "accommodation", "accommodations", "stay"},
+            "nairobi":      {"nbo"},
+            "lagos":        {"los"},
+            "johannesburg": {"joburg", "jozi", "jhb"},
+            "university":   {"uni", "campus", "college"},
+            "course":       {"programme", "program"},
+            "apply":        {"application", "admission", "admissions", "enroll", "enrolment", "enrollment"},
+            "fee":          {"fees", "tuition"},
+            "scholarship":  {"bursary", "bursaries"},
+            "bus":          {"matatu", "minibus"},
+        }
+        // Domain priors: boost African ccTLDs and common academic/government second-levels
+        pri := Priors{
+            ".africa": 1.25,
+            // East Africa
+            ".ke": 1.35, ".co.ke": 1.35, ".ac.ke": 1.45, ".go.ke": 1.35,
+            ".ug": 1.3,  ".co.ug": 1.3,  ".ac.ug": 1.4,  ".go.ug": 1.3,
+            ".tz": 1.3,  ".co.tz": 1.3,  ".ac.tz": 1.4,  ".go.tz": 1.3,
+            ".rw": 1.25, ".ac.rw": 1.35, ".gov.rw": 1.25,
+            ".ss": 1.15, ".ac.ss": 1.2,  ".gov.ss": 1.15, // South Sudan
+            ".et": 1.25, ".edu.et": 1.35, ".gov.et": 1.25,
+            ".so": 1.15, ".gov.so": 1.15,
+            // Southern Africa
+            ".za": 1.25, ".ac.za": 1.4,  ".gov.za": 1.25,
+            ".bw": 1.2,  ".ac.bw": 1.3,  ".gov.bw": 1.2,
+            ".na": 1.2,  ".ac.na": 1.3,  ".gov.na": 1.2,
+            ".mz": 1.2,  ".ac.mz": 1.3,  ".gov.mz": 1.2,
+            ".zw": 1.2,  ".ac.zw": 1.35, ".gov.zw": 1.2,
+            ".zm": 1.2,  ".ac.zm": 1.3,  ".gov.zm": 1.2,
+            ".ls": 1.15, ".ac.ls": 1.2,  ".gov.ls": 1.15,
+            ".sz": 1.15, ".ac.sz": 1.2,  ".gov.sz": 1.15, // Eswatini
+            // West Africa
+            ".ng": 1.25, ".edu.ng": 1.4,  ".gov.ng": 1.25,
+            ".gh": 1.2,  ".edu.gh": 1.3,  ".gov.gh": 1.2,
+            ".ci": 1.15, ".ac.ci": 1.2,  ".gouv.ci": 1.15,
+            ".sn": 1.15, ".ucad.sn": 1.25, ".gouv.sn": 1.15, // include a common uni host suffix exemplar
+            ".gm": 1.1,  ".gov.gm": 1.1,
+            ".sl": 1.1,  ".gov.sl": 1.1,
+            ".lr": 1.1,  ".gov.lr": 1.1,
+            // Central Africa
+            ".cm": 1.15, ".edu.cm": 1.25, ".gov.cm": 1.15,
+            ".cd": 1.15, ".ac.cd": 1.2,  ".gov.cd": 1.15,
+            ".ga": 1.1,  ".gov.ga": 1.1,
+            ".cg": 1.1,  ".gov.cg": 1.1,
+            ".ao": 1.15, ".gov.ao": 1.15,
+        }
+        // Apply and persist
+        state.synonyms = Synonyms{}
+        for k, v := range syn { state.synonyms[k] = v }
+        searchindex.SetSynonyms(state.synonyms)
+        state.saveSynonyms()
+
+        state.priors = Priors{}
+        for k, v := range pri { state.priors[k] = v }
+        searchindex.SetDomainPriors(state.priors)
+        state.savePriors()
+
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"synonyms": state.synonyms, "priors": state.priors}})
+    })
 
 	type BulkWebDoc struct {
 		ID       string `json:"id"`
