@@ -42,12 +42,14 @@ type serverState struct {
 	muWeb    sync.Mutex
 	muImages sync.Mutex
 	muVideos sync.Mutex
-	muNews   sync.Mutex
+    muNews   sync.Mutex
+    muTransport sync.Mutex
 
 	dirtyWeb    bool
 	dirtyImages bool
 	dirtyVideos bool
-	dirtyNews   bool
+    dirtyNews   bool
+    dirtyTransport bool
 
 	crawlStats CrawlerStats
 	synonyms   Synonyms
@@ -80,10 +82,11 @@ func newServerState(cfg config.Config, store *searchindex.Store) *serverState {
 }
 
 func (s *serverState) loadIndexes() {
-	_ = s.store.Web.Load(s.snapshotPath("web.json"))
-	_ = s.store.Images.Load(s.snapshotPath("images.json"))
-	_ = s.store.Videos.Load(s.snapshotPath("videos.json"))
-	_ = s.store.News.Load(s.snapshotPath("news.json"))
+    _ = s.store.Web.Load(s.snapshotPath("web.json"))
+    _ = s.store.Images.Load(s.snapshotPath("images.json"))
+    _ = s.store.Videos.Load(s.snapshotPath("videos.json"))
+    _ = s.store.News.Load(s.snapshotPath("news.json"))
+    _ = s.store.Transport.Load(s.snapshotPath("transport.json"))
 }
 
 func (s *serverState) loadMetadata() {
@@ -124,13 +127,14 @@ func (s *serverState) startAutosave() {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for range ticker.C {
-			s.flushDirty(&s.muWeb, &s.dirtyWeb, s.store.Web, "web.json")
-			s.flushDirty(&s.muImages, &s.dirtyImages, s.store.Images, "images.json")
-			s.flushDirty(&s.muVideos, &s.dirtyVideos, s.store.Videos, "videos.json")
-			s.flushDirty(&s.muNews, &s.dirtyNews, s.store.News, "news.json")
-		}
-	}()
+        for range ticker.C {
+            s.flushDirty(&s.muWeb, &s.dirtyWeb, s.store.Web, "web.json")
+            s.flushDirty(&s.muImages, &s.dirtyImages, s.store.Images, "images.json")
+            s.flushDirty(&s.muVideos, &s.dirtyVideos, s.store.Videos, "videos.json")
+            s.flushDirty(&s.muNews, &s.dirtyNews, s.store.News, "news.json")
+            s.flushDirty(&s.muTransport, &s.dirtyTransport, s.store.Transport, "transport.json")
+        }
+    }()
 }
 
 func (s *serverState) flushDirty(mu *sync.Mutex, dirty *bool, ix *searchindex.Index, filename string) {
@@ -189,16 +193,18 @@ func (s *serverState) snapshotPath(name string) string {
 }
 
 func (s *serverState) resourcesFor(vertical string) (*searchindex.Index, *sync.Mutex, *bool, string, bool) {
-	switch vertical {
-	case "web":
-		return s.store.Web, &s.muWeb, &s.dirtyWeb, "web.json", true
-	case "images":
-		return s.store.Images, &s.muImages, &s.dirtyImages, "images.json", true
-	case "videos":
-		return s.store.Videos, &s.muVideos, &s.dirtyVideos, "videos.json", true
-	case "news":
-		return s.store.News, &s.muNews, &s.dirtyNews, "news.json", true
-	default:
-		return nil, nil, nil, "", false
-	}
+    switch vertical {
+    case "web":
+        return s.store.Web, &s.muWeb, &s.dirtyWeb, "web.json", true
+    case "images":
+        return s.store.Images, &s.muImages, &s.dirtyImages, "images.json", true
+    case "videos":
+        return s.store.Videos, &s.muVideos, &s.dirtyVideos, "videos.json", true
+    case "news":
+        return s.store.News, &s.muNews, &s.dirtyNews, "news.json", true
+    case "transport":
+        return s.store.Transport, &s.muTransport, &s.dirtyTransport, "transport.json", true
+    default:
+        return nil, nil, nil, "", false
+    }
 }

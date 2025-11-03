@@ -175,7 +175,7 @@ func registerAdminRoutes(app *fiber.App, state *serverState) {
 		return c.JSON(fiber.Map{"success": true})
 	})
 
-	app.Post("/v1/admin/index/:vertical/clear", func(c *fiber.Ctx) error {
+    app.Post("/v1/admin/index/:vertical/clear", func(c *fiber.Ctx) error {
 		v := c.Params("vertical")
 		source := c.Query("source", "")
 		host := c.Query("host", "")
@@ -446,7 +446,7 @@ func registerAdminRoutes(app *fiber.App, state *serverState) {
 	type BulkNews struct {
 		Docs []NewsDoc `json:"docs"`
 	}
-	app.Post("/v1/admin/index/news", func(c *fiber.Ctx) error {
+    app.Post("/v1/admin/index/news", func(c *fiber.Ctx) error {
 		ix, mu, dirty, _, _ := state.resourcesFor("news")
 		var body BulkNews
 		if err := c.BodyParser(&body); err != nil {
@@ -461,5 +461,30 @@ func registerAdminRoutes(app *fiber.App, state *serverState) {
 			*dirty = true
 		}
 		return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
-	})
+    })
+
+    // Transport bulk upsert (structured results with meta fields)
+    type TransportDoc struct {
+        ID      string            `json:"id"`
+        Title   string            `json:"title"`
+        Url     string            `json:"url"`
+        Snippet string            `json:"snippet"`
+        Source  string            `json:"source"`
+        Date    string            `json:"date"`
+        Meta    map[string]string `json:"meta"` // keys: from, to, depart, return, operator, price
+    }
+    type BulkTransport struct { Docs []TransportDoc `json:"docs"` }
+    app.Post("/v1/admin/index/transport", func(c *fiber.Ctx) error {
+        ix, mu, dirty, _, _ := state.resourcesFor("transport")
+        var body BulkTransport
+        if err := c.BodyParser(&body); err != nil {
+            return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "message": "invalid body"})
+        }
+        mu.Lock(); defer mu.Unlock()
+        for _, d := range body.Docs {
+            ix.Add(searchindex.Doc{ID: d.ID, Title: d.Title, Url: d.Url, Snippet: d.Snippet, Source: d.Source, Date: d.Date, Meta: d.Meta})
+        }
+        if dirty != nil { *dirty = true }
+        return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"upserted": len(body.Docs)}})
+    })
 }

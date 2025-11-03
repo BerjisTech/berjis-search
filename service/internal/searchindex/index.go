@@ -22,6 +22,7 @@ type Doc struct {
     Source  string
     Date    string // RFC3339 preferred
     Lang    string // ISO 639-1 (e.g., "en"), optional
+    Meta    map[string]string `json:"meta,omitempty"`
 }
 
 type Index struct {
@@ -588,6 +589,48 @@ func (ix *Index) FilteredSearch(q string, source string, lang string, from strin
     return diversified[start:end], total, facets
 }
 
+// FilteredSearchTransport adds support for filtering by transport meta fields: from, to, depart, return.
+// Expect meta keys: from, to, depart, return (lowercase). Depart/return are YYYY-MM-DD or RFC3339.
+func (ix *Index) FilteredSearchTransport(q string, meta map[string]string, sortBy string, page int, size int) ([]Result, int, map[string]int64) {
+    if size <= 0 { size = 10 }
+    if page <= 0 { page = 1 }
+    results := ix.Search(q, 10000)
+    filtered := make([]Result, 0, len(results))
+    facets := map[string]int64{}
+    wantFrom := strings.ToLower(strings.TrimSpace(meta["from"]))
+    wantTo := strings.ToLower(strings.TrimSpace(meta["to"]))
+    wantDepart := strings.TrimSpace(meta["depart"]) // raw compare substring or same-day match
+    wantReturn := strings.TrimSpace(meta["return"]) // optional
+    for _, r := range results {
+        d := r.Doc
+        if d.Meta == nil { d.Meta = map[string]string{} }
+        if wantFrom != "" && strings.ToLower(d.Meta["from"]) != wantFrom { continue }
+        if wantTo != "" && strings.ToLower(d.Meta["to"]) != wantTo { continue }
+        if wantDepart != "" && !strings.Contains(d.Meta["depart"], wantDepart) { continue }
+        if wantReturn != "" && !strings.Contains(d.Meta["return"], wantReturn) { continue }
+        filtered = append(filtered, r)
+        facets[d.Source] = facets[d.Source] + 1
+    }
+    if sortBy == "latest" {
+        sort.SliceStable(filtered, func(i, j int) bool {
+            di, dj := filtered[i].Doc, filtered[j].Doc
+            ti, ei := parseDate(di.Date)
+            tj, ej := parseDate(dj.Date)
+            if ei != nil && ej != nil { return filtered[i].Score > filtered[j].Score }
+            if ei != nil { return false }
+            if ej != nil { return true }
+            return ti.After(tj)
+        })
+    }
+    diversified := diversifyBySource(filtered, maxPerSource)
+    total := len(diversified)
+    start := (page - 1) * size
+    if start > total { return []Result{}, total, facets }
+    end := start + size
+    if end > total { end = total }
+    return diversified[start:end], total, facets
+}
+
 func parseDate(s string) (time.Time, error) {
     if strings.TrimSpace(s) == "" { return time.Time{}, os.ErrInvalid }
     if t, err := time.Parse(time.RFC3339, s); err == nil { return t, nil }
@@ -713,9 +756,10 @@ type Store struct {
     Images *Index
     Videos *Index
     News   *Index
+    Transport *Index
 }
 
-func NewStore() *Store { return &Store{Web: New(), Images: New(), Videos: New(), News: New()} }
+func NewStore() *Store { return &Store{Web: New(), Images: New(), Videos: New(), News: New(), Transport: New()} }
 
 // Utilities for admin/inspection
 func (ix *Index) Total() int { return ix.total }

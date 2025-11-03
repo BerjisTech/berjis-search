@@ -58,7 +58,14 @@ type WebDoc struct{ ID, Title, Url, Snippet, Body, Headings, Source, Date, Lang 
 func main() {
 	_ = config.Load() // reserved for future use
 	base := getenv("SEARCH_API_BASE", "http://search-service:8092")
-	rawSeeds := strings.Split(os.Getenv("SEED_URLS"), ",")
+    // Allow separate seeds when running a dedicated transport crawler
+    rawSeedEnv := os.Getenv("SEED_URLS")
+    if strings.TrimSpace(os.Getenv("CRAWL_VERTICAL")) == "transport" {
+        if ts := strings.TrimSpace(os.Getenv("TRANSPORT_SEEDS")); ts != "" {
+            rawSeedEnv = ts
+        }
+    }
+    rawSeeds := strings.Split(rawSeedEnv, ",")
 	seeds := make([]string, 0, len(rawSeeds)+8)
 	for _, raw := range rawSeeds {
 		if normalized := normalizeSeed(raw); normalized != "" {
@@ -117,15 +124,18 @@ func main() {
 	if batchSize <= 0 {
 		batchSize = 100
 	}
-	addWeb := func(d WebDoc) {
-		batchMu.Lock()
-		defer batchMu.Unlock()
-		webBatch = append(webBatch, d)
-		if len(webBatch) >= batchSize {
-			postJSON(base+"/v1/admin/index/web", map[string]any{"docs": webBatch})
-			webBatch = webBatch[:0]
-		}
-	}
+    // Choose vertical for posting (default: web)
+    vertical := strings.TrimSpace(os.Getenv("CRAWL_VERTICAL"))
+    if vertical == "" { vertical = "web" }
+    addWeb := func(d WebDoc) {
+        batchMu.Lock()
+        defer batchMu.Unlock()
+        webBatch = append(webBatch, d)
+        if len(webBatch) >= batchSize {
+            postJSON(base+"/v1/admin/index/"+vertical, map[string]any{"docs": webBatch})
+            webBatch = webBatch[:0]
+        }
+    }
 	addImg := func(m map[string]string) {
 		batchMu.Lock()
 		defer batchMu.Unlock()
@@ -348,9 +358,9 @@ func main() {
 	}
 	// Final flush
 	batchMu.Lock()
-	if len(webBatch) > 0 {
-		postJSON(base+"/v1/admin/index/web", map[string]any{"docs": webBatch})
-	}
+    if len(webBatch) > 0 {
+        postJSON(base+"/v1/admin/index/"+vertical, map[string]any{"docs": webBatch})
+    }
 	if len(imgBatch) > 0 {
 		postJSON(base+"/v1/admin/index/images", map[string]any{"docs": imgBatch})
 	}

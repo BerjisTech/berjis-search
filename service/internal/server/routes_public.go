@@ -171,6 +171,26 @@ func registerSearchRoutes(app *fiber.App, state *serverState) {
 			}
 			return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sortBy, "page": page, "total": len(results), "results": results}})
 
+		case "transport":
+			fromQ := strings.TrimSpace(c.Query("from"))
+			toQ := strings.TrimSpace(c.Query("to"))
+			departQ := strings.TrimSpace(c.Query("depart"))
+			returnQ := strings.TrimSpace(c.Query("return"))
+			meta := map[string]string{"from": strings.ToLower(fromQ), "to": strings.ToLower(toQ), "depart": departQ, "return": returnQ}
+			found, totalCount, facets := state.store.Transport.FilteredSearchTransport(q, meta, sortBy, page, 10)
+			type TOut struct {
+				Title   string            `json:"title"`
+				Url     string            `json:"url"`
+				Snippet string            `json:"snippet"`
+				Source  string            `json:"source"`
+				Meta    map[string]string `json:"meta"`
+			}
+			out := make([]TOut, 0, len(found))
+			for _, r := range found {
+				out = append(out, TOut{Title: htmlpkg.UnescapeString(r.Doc.Title), Url: r.Doc.Url, Snippet: r.Doc.Snippet, Source: r.Doc.Source, Meta: r.Doc.Meta})
+			}
+			return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sortBy, "page": page, "total": totalCount, "results": out, "facets": fiber.Map{"source": facets}}})
+
 		default:
 			return c.JSON(fiber.Map{"success": true, "data": fiber.Map{"q": q, "type": typ, "sort": sortBy, "page": page, "total": len(defaultResults), "results": defaultResults}})
 		}
