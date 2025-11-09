@@ -1,8 +1,10 @@
-FROM golang:1.22 as build
+FROM golang:1.22 AS build
 WORKDIR /src
-COPY go.mod ./
+COPY search/service/go.mod ./go.mod
+COPY search/service/go.sum ./go.sum
+COPY shared/coreauth /shared/coreauth
 RUN go mod download
-COPY . .
+COPY search/service/ ./
 RUN go mod tidy && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/search-service ./cmd/service && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/search-crawler ./cmd/crawler && \
